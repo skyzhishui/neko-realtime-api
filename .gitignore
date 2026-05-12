@@ -1,0 +1,5 @@
+config.yaml
+server.log
+__pycache__/
+*.pyc
+*.pyo

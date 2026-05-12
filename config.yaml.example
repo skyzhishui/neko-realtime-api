@@ -1,0 +1,244 @@
+# ============================================================
+# neko-realtime-api 配置文件示例
+# ============================================================
+# 复制此文件为 config.yaml 并根据实际环境修改配置值
+# 所有 IP 地址需替换为实际服务地址，端口需替换为实际端口
+# ============================================================
+
+# ------------------------------------------------------------
+# 实时服务器配置
+# ------------------------------------------------------------
+realtime_server:
+  # 服务监听地址，0.0.0.0 表示监听所有网卡
+  host: 0.0.0.0
+
+  # 服务监听端口
+  port: 8765
+
+  # 是否启用认证，启用后客户端连接需携带 Bearer Token
+  auth_enabled: false
+
+  # 认证令牌，当 auth_enabled=true 时生效
+  # 客户端需在 WebSocket 连接时通过 Authorization 头传入
+  auth_token: local-no-key-needed
+
+  # 默认工作模式
+  # - omni_audio: B模式（全双工模式），音频直接送入 Omni 模型，延迟更低
+  # - asr_llm:    A模式（ASR+LLM模式），先 ASR 转文字再送 LLM，作为降级备选
+  default_mode: asr_llm
+
+  # Omni 连续错误次数阈值，超过后自动降级到 A模式
+  # 设为 0 可禁用自动降级
+  omni_error_threshold: 3
+
+  # 降级持续时间（秒），A模式降级后经过此时间会尝试恢复 B模式
+  fallback_duration_s: 60
+
+# ------------------------------------------------------------
+# VAD（语音活动检测）配置
+# ------------------------------------------------------------
+vad:
+  # VAD 引擎类型
+  # - silero: 使用 Silero VAD 模型（推荐，支持 ONNX/PyTorch 自动降级）
+  engine: silero
+
+  # 语音检测阈值（0.0~1.0），值越高要求越严格
+  # - 较低值（0.3~0.5）: 更灵敏，容易误触发，适合安静环境
+  # - 较高值（0.6~0.8）: 更保守，减少误触发，适合嘈杂环境
+  threshold: 0.8
+
+  # 静音超时时间（毫秒），检测到持续静音后判定用户说完
+  # - 较短值（300~400ms）: 响应更快，但可能打断思考停顿
+  # - 较长值（500~700ms）: 容忍更长的思考停顿
+  silence_timeout_ms: 400
+
+  # 最短语音时长（毫秒），短于此时间的语音片段将被忽略（过滤噪声）
+  min_speech_duration_ms: 300
+
+  # 最大音频时长（毫秒），超过后强制截断并触发处理
+  # 防止用户长时间说话导致内存溢出
+  max_audio_duration_ms: 30000
+
+  # 前缀填充时长（毫秒），语音开始前保留的音频缓冲
+  # 用于避免语音开头被截断（吞字问题）
+  prefix_padding_ms: 500
+
+  # 音频采样率（Hz），通常为 16000
+  sample_rate: 16000
+
+  # Silero VAD 模型目录路径
+  # 指向包含 silero_vad.onnx 和/或 silero_vad.jit 的目录
+  # 设为 null 则使用 modelscope 缓存目录自动下载
+  silero_model_path: ./models/silero-vad
+
+  # 是否启用 Smart Turn v3.2 话轮结束检测
+  # 启用后，静音超时时会进行二次判断：
+  #   - Complete: 用户说完了，触发 speech_stopped
+  #   - Incomplete: 用户在思考/犹豫，重置静音计数继续等待
+  # 禁用则直接根据静音超时判定
+  smart_turn_enabled: true
+
+  # Smart Turn 模型目录路径
+  # 指向包含 smart-turn-v3.2-gpu.onnx 的目录
+  # 设为 null 则使用 modelscope 缓存目录自动下载
+  smart_turn_path: ./models/smart-turn-v3
+
+  # Smart Turn 话轮结束判断阈值（0.0~1.0）
+  # sigmoid 输出 > threshold 判定为 Complete（用户说完了）
+  # - 较低值（0.3~0.4）: 更容易判定为说完了，响应更快
+  # - 较高值（0.5~0.6）: 更保守，容忍更长的停顿
+  smart_turn_threshold: 0.5
+
+# ------------------------------------------------------------
+# 外部服务配置
+# ------------------------------------------------------------
+services:
+  # ---- Omni 多模态模型服务（A和B模式通用） ----
+  omni:
+    # Omni API 基础地址（兼容 OpenAI Chat Completions 接口）
+    base_url: http://localhost:8000
+
+    # 模型名称，需与后端实际部署的模型一致
+    model: Qwen3.6-35B-A3B
+
+    # 请求超时时间（秒）
+    timeout_s: 30
+
+    # 最大生成 token 数
+    max_tokens: 512
+
+    # 生成温度（0.0~2.0），值越高输出越随机
+    temperature: 1
+
+    # 重复惩罚（>1.0 抑制重复），值越大惩罚越强
+    repetition_penalty: 1.2
+
+  # ---- ASR 语音识别服务 ----
+  asr:
+    # 远程 ASR API 基础地址（local_asr=false 时使用）
+    # 兼容 OpenAI Whisper 接口: POST {base_url}/v1/audio/transcriptions
+    # 设为 null 则禁用远程 ASR
+    base_url: null
+
+    # ASR 模型名称
+    model: SenseVoiceSmall
+
+    # 识别语言代码
+    # - zh: 中文
+    # - en: 英文
+    # - ja: 日文
+    # - auto: 自动检测
+    language: zh
+
+    # ASR 请求超时时间（秒）
+    timeout_s: 10
+
+    # 是否使用 WebSocket 方式调用远程 ASR（而非 HTTP）
+    # - false: HTTP 方式，POST 音频文件，延迟约 260ms（2s 音频）
+    # - true:  WebSocket 方式，流式发送 PCM，适合长音频
+    use_ws: false
+
+    # 是否使用本地 ASR 引擎（GPU 推理，SenseVoiceSmall via FunASR）
+    # - true:  本地 GPU 推理，需安装 FunASR + CUDA，启动时预加载模型
+    # - false: 使用远程 ASR 服务（通过 base_url 调用）
+    local_asr: true
+
+    # 本地 ASR 模型路径（仅 local_asr=true 时生效）
+    # 设为 null 则使用 modelscope 默认缓存（iic/SenseVoiceSmall）
+    asr_model_path: ./models/SenseVoiceSmall
+
+  # ---- TTS 语音合成服务 ----
+  tts:
+    # TTS HTTP API 基础地址（mode=http 时使用）
+    # 兼容 OpenAI Speech 接口: POST {base_url}/v1/audio/speech
+    base_url: http://localhost:8091
+
+    # TTS WebSocket 流式地址（mode=ws 时使用）
+    # 逐字流式合成，延迟更低
+    ws_url: ws://localhost:8091/v1/audio/speech/stream
+
+    # TTS 调用模式
+    # - http: 分句 HTTP 模式，LLM 输出按标点分句后逐句请求 TTS ✅
+    # - ws:   WebSocket 逐字流式模式，LLM 每个 token 即时送 TTS，首音频延迟更低 ✅
+    mode: http
+
+    # TTS 模型名称
+    model: Qwen3-TTS
+
+    # 默认音色名称（可被客户端 session.update 覆盖）
+    # 取决于 TTS 后端支持的音色
+    voice: hutao
+
+    # 音频输出格式
+    # - pcm: 原始 PCM 数据（低延迟，适合实时流式）
+    response_format: pcm
+
+    # 是否启用流式输出
+    stream: true
+
+    # 流式输出格式（stream=true 时生效）
+    # - audio: 直接输出音频数据
+    stream_format: audio
+
+    # TTS 语言设置
+    # - Chinese: 中文
+    # - English: 英文
+    # - Japanese: 日文
+    language: Chinese
+
+    # TTS 输出采样率（Hz）
+    # Qwen3-TTS 固定输出 24000Hz
+    sample_rate: 24000
+
+    # TTS 请求超时时间（秒）
+    timeout_s: 15
+
+  # ---- GSV-TTS-Lite 语音克隆 TTS 配置 ----
+  # 当 services.tts.mode 为 http 且 gsv_tts.enabled=true 时，
+  # 会使用 GSV-TTS-Lite 替代 Qwen3-TTS 进行语音合成
+  # GSV-TTS-Lite 使用 HTTP POST + SSE（非 WebSocket）
+  # 音频输出: int16 PCM 32kHz，自动重采样到 tts_pipeline.output_sample_rate
+  # 特性: 音色风格解耦（speaker_audio + prompt_audio）、自动 ASR
+  gsv_tts:
+    # 是否启用 GSV-TTS-Lite（启用后会替代 Qwen3-TTS）
+    enabled: false
+
+    # GSV-TTS-Lite API 基础地址
+    base_url: http://localhost:8001
+
+    # 说话人参考音频路径（控制音色/谁在说话）
+    # 支持本地文件路径或 HTTP/HTTPS URL
+    speaker_audio: ./examples/yaoyao.wav
+
+    # 提示参考音频路径（控制风格/情感/怎么说）
+    # 支持本地文件路径或 HTTP/HTTPS URL
+    prompt_audio: ./examples/yaoyao.wav
+
+    # 提示文本（对应 prompt_audio 的文字内容）
+    # 为空时自动使用 ASR 识别 prompt_audio 的内容
+    prompt_text: 今天天气很好，等下可以把你的被子拿出来晒晒。
+
+    # HTTP 请求超时（秒）
+    timeout_s: 30
+
+    # 语速倍率
+    speed: 1.0
+
+# ------------------------------------------------------------
+# TTS 管线配置（控制 TTS 输出的后处理行为）
+# ------------------------------------------------------------
+tts_pipeline:
+  # 最小子句长度（字符数），LLM 输出文本按标点分句时
+  # 短于此长度的子句不会单独送 TTS，会等待更多文本累积
+  # - 较小值（4~6）: 更快开始合成，但可能断句不自然
+  # - 较大值（8~12）: 更自然的断句，但首音频延迟略增
+  min_sub_sentence_len: 6
+
+  # 是否对 TTS 输出进行重采样
+  # - true:  将 TTS 输出重采样到 output_sample_rate（可能降低音质）
+  # - false: 保持 TTS 原始采样率输出（推荐，音质最佳）
+  resample_output: false
+
+  # 重采样目标采样率（仅 resample_output=true 时生效）
+  # 如果 TTS 输出 24000Hz 但客户端需要 16000Hz，可启用重采样
+  output_sample_rate: 24000

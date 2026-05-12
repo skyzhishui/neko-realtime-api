@@ -1,0 +1,57 @@
+# ============================================
+# Neko Realtime API - Python Dependencies
+# ============================================
+# Core dependencies (required)
+# ============================================
+
+# Web framework & server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# Async HTTP client (for Omni LLM, ASR, TTS HTTP calls)
+aiohttp>=3.9.0
+
+# WebSocket client (for TTS WS streaming & ASR WS)
+websockets>=12.0
+
+# Audio processing
+numpy>=1.26.0
+
+# Configuration
+pyyaml>=6.0
+
+# ============================================
+# VAD & Smart Turn dependencies (required)
+# ============================================
+
+# Silero VAD - PyTorch backend (fallback)
+torch>=2.2.0
+torchaudio>=2.2.0
+
+# ONNX Runtime - VAD & Smart Turn inference (preferred backend)
+# Use onnxruntime-gpu for CUDA acceleration, or onnxruntime for CPU only
+onnxruntime-gpu>=1.18.0    # GPU (recommended)
+# onnxruntime>=1.18.0      # CPU fallback (uncomment if no GPU)
+
+# Silero VAD model package
+silero-vad>=5.1
+
+# Transformers - WhisperFeatureExtractor for Smart Turn
+transformers>=4.40.0
+
+# ============================================
+# Model download & management
+# ============================================
+
+# ModelScope - auto-download VAD/SmartTurn/ASR models
+modelscope>=1.18.0
+
+# ============================================
+# Local ASR dependencies (optional, enable if local_asr=true)
+# ============================================
+
+# FunASR - SenseVoiceSmall local inference
+funasr>=1.1.0
+
+# Librosa - audio resampling for local ASR
+librosa>=0.10.0
