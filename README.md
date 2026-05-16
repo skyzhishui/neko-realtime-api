@@ -45,9 +45,9 @@ cp config.yaml.example config.yaml
 | `realtime_server.port` | 监听端口 | `8765` |
 | `realtime_server.default_mode` | 默认工作模式 | `asr_llm` |
 | `realtime_server.auth_enabled` | 是否启用认证 | `false` |
-| `services.omni.base_url` | Omni 模型 API 地址 | `http://localhost:8000` |
+| `services.omni.base_url` | Omni 模型 API 地址 | `http://localhost:8000/v1` |
 | `services.asr.local_asr` | 是否使用本地 ASR | `true` |
-| `services.tts.base_url` | TTS HTTP API 地址 | `http://localhost:8091` |
+| `services.tts.base_url` | TTS HTTP API 地址 | `http://localhost:8091/v1` |
 | `services.tts.mode` | TTS 调用模式 (`http`/`ws`) | `http` |
 | `services.gsv_tts.enabled` | 是否启用 GSV-TTS-Lite 语音合成 | `false` |
 
@@ -150,12 +150,12 @@ asyncio.run(main())
 
 | 服务 | 用途 | 默认地址 |
 |------|------|----------|
-| Omni 多模态模型 | LLM 推理（A/B 模式通用） | `http://localhost:8000` |
-| TTS 服务 | 语音合成（Qwen3-TTS） | `http://localhost:8091` |
+| Omni 多模态模型 | LLM 推理（A/B 模式通用） | `http://localhost:8000/v1` |
+| TTS 服务 | 语音合成（Qwen3-TTS） | `http://localhost:8091/v1` |
 | GSV-TTS-Lite | 语音克隆 TTS（可选） | `http://localhost:8001` |
-| 远程 ASR | 语音识别（local_asr=false 时） | 可配置 |
+| 远程 ASR | 语音识别（local_asr=false 时） | `http://localhost:8082/v1` |
 
-Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式
+Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。`base_url` 配置项需包含 `/v1` 路径前缀（如 `http://localhost:8000/v1`）。
 
 ## License
 

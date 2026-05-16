@@ -96,7 +96,8 @@ services:
   # ---- Omni 多模态模型服务（A和B模式通用） ----
   omni:
     # Omni API 基础地址（兼容 OpenAI Chat Completions 接口）
-    base_url: http://localhost:8000
+    # 需包含 /v1 前缀，如 http://localhost:8000/v1
+    base_url: http://localhost:8000/v1/v1
 
     # 模型名称，需与后端实际部署的模型一致
     model: Qwen3.6-35B-A3B
@@ -116,7 +117,7 @@ services:
   # ---- ASR 语音识别服务 ----
   asr:
     # 远程 ASR API 基础地址（local_asr=false 时使用）
-    # 兼容 OpenAI Whisper 接口: POST {base_url}/v1/audio/transcriptions
+    # 兼容 OpenAI Whisper 接口: POST {base_url}/audio/transcriptions
     # 设为 null 则禁用远程 ASR
     base_url: null
 
@@ -150,8 +151,8 @@ services:
   # ---- TTS 语音合成服务 ----
   tts:
     # TTS HTTP API 基础地址（mode=http 时使用）
-    # 兼容 OpenAI Speech 接口: POST {base_url}/v1/audio/speech
-    base_url: http://localhost:8091
+    # 兼容 OpenAI Speech 接口: POST {base_url}/audio/speech
+    base_url: http://localhost:8091/v1
 
     # TTS WebSocket 流式地址（mode=ws 时使用）
     # 逐字流式合成，延迟更低

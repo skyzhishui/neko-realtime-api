@@ -1,7 +1,7 @@
 """GSV-TTS-Lite Pipeline - HTTP SSE streaming + punctuation-based sentence splitting.
 
 Architecture: mirrors TTSPipeline (qwen3-tts) but targets GSV-TTS-Lite's
-/tts/stream SSE endpoint instead of Qwen3-TTS's /v1/audio/speech.
+/tts/stream SSE endpoint instead of Qwen3-TTS's /audio/speech.
 
 Core flow:
 1. LLM outputs text delta -> SentenceSplitter detects complete sentences

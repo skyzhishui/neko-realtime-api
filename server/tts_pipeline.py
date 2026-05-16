@@ -94,7 +94,7 @@ class TTSPipeline:
         session = await self._get_session()
         try:
             async with session.post(
-                f"{self.base_url}/v1/audio/speech",
+                f"{self.base_url}/audio/speech",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=self.timeout_s),
             ) as resp:

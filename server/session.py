@@ -146,12 +146,12 @@ class RealtimeSession:
         
         # Clients
         self.omni_client = OmniAudioClient(
-            base_url=config.get("services", "omni", "base_url", default="http://localhost:8000"),
+            base_url=config.get("services", "omni", "base_url", default="http://localhost:8000/v1"),
             model=config.get("services", "omni", "model", default="Qwen3-Omni-30B-A3B-Instruct-AWQ-8bit"),
         )
         
         self.asr_client = SenseVoiceASRClient(
-            base_url=config.get("services", "asr", "base_url", default="http://localhost:8082"),
+            base_url=config.get("services", "asr", "base_url", default="http://localhost:8082/v1"),
         )
         
         # Local ASR engine (singleton, shared across sessions)
@@ -168,7 +168,7 @@ class RealtimeSession:
                 self.local_asr = LocalASREngine(model_path=asr_model_path)
         
         self.tts_pipeline = TTSPipeline(
-            base_url=config.get("services", "tts", "base_url", default="http://localhost:8091"),
+            base_url=config.get("services", "tts", "base_url", default="http://localhost:8091/v1"),
             voice=self.session_config.voice,  # C1 fix: 使用 session_config.voice
             sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
             timeout_s=config.get("services", "tts", "timeout_s", default=15),

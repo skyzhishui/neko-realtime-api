@@ -45,7 +45,7 @@ class SenseVoiceASRClient:
         
         try:
             async with session.post(
-                f"{self.base_url}/v1/audio/transcriptions",
+                f"{self.base_url}/audio/transcriptions",
                 data=data,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:

@@ -61,7 +61,7 @@ class OmniAudioClient:
         session = await self._get_session()
         try:
             async with session.post(
-                f"{self.base_url}/v1/chat/completions",
+                f"{self.base_url}/chat/completions",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=timeout_s),
             ) as resp:
