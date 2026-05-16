@@ -15,19 +15,23 @@ class AudioBufferManager:
         self.sample_rate = sample_rate
         self.chunks: list[bytes] = []
         self.image_chunks: list[str] = []  # base64 jpeg
+        self._total_bytes = 0
 
     def append_audio(self, pcm16_b64: str):
         """Append base64-encoded PCM16 audio."""
         raw = base64.b64decode(pcm16_b64)
         self.chunks.append(raw)
+        self._total_bytes += len(raw)
 
     def append_audio_raw(self, pcm16_bytes: bytes):
         """Append raw PCM16 audio bytes."""
         self.chunks.append(pcm16_bytes)
+        self._total_bytes += len(pcm16_bytes)
 
     def clear_audio(self):
         """Clear audio buffer."""
         self.chunks.clear()
+        self._total_bytes = 0
 
     def append_image(self, image_b64: str):
         """Append base64-encoded JPEG image."""
@@ -40,6 +44,13 @@ class AudioBufferManager:
     def get_full_pcm(self) -> bytes:
         """Get complete PCM16 audio."""
         return b"".join(self.chunks)
+
+    def swap_and_clear(self) -> bytes:
+        """Atomically return all PCM data and clear the buffer."""
+        pcm = b"".join(self.chunks)
+        self.chunks.clear()
+        self._total_bytes = 0
+        return pcm
 
     def get_wav_b64(self) -> str:
         """Encode buffer audio as WAV + base64 (for Omni input_audio)."""
@@ -65,10 +76,10 @@ class AudioBufferManager:
 
     def get_duration_ms(self) -> float:
         """Get buffer audio duration in ms."""
-        total_samples = len(self.get_full_pcm()) // 2  # PCM16 = 2 bytes/sample
-        return total_samples / self.sample_rate * 1000
+        return (self._total_bytes // 2) / self.sample_rate * 1000
 
     def reset(self):
         """Reset all buffers."""
         self.chunks.clear()
         self.image_chunks.clear()
+        self._total_bytes = 0

@@ -57,9 +57,16 @@ class GsvTtsPipeline:
         self.gsv_sample_rate = 32000  # GSV-TTS-Lite fixed output 32kHz
         self.timeout_s = timeout_s
         self.speed = speed
+        self._session: aiohttp.ClientSession | None = None
 
         # Pre-compute resample ratio
         self._resample_ratio = self.gsv_sample_rate / self.sample_rate_out
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
 
     def _resample_32k_to_24k(self, pcm_int16: bytes) -> bytes:
         """Resample 32kHz int16 PCM to 24kHz int16 PCM using linear interpolation."""
@@ -103,75 +110,80 @@ class GsvTtsPipeline:
 
         t_tts_sent = time.time()
         first_chunk_logged = False
-        timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+        session = await self._get_session()
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                async with session.post(
-                    f"{self.base_url}/tts/stream",
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"GSV-TTS error {resp.status}: {error_text[:500]}")
-                        return
+        try:
+            async with session.post(
+                f"{self.base_url}/tts/stream",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.timeout_s),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"GSV-TTS error {resp.status}: {error_text[:500]}")
+                    return
 
-                    # Parse SSE stream manually (avoid aiohttp line-size limit of 128KB)
-                    # base64 audio data in SSE can easily exceed that limit
-                    sse_buffer = b""
-                    current_event = None
-                    async for chunk in resp.content.iter_any():
-                        sse_buffer += chunk
-                        # Process complete SSE messages (delimited by \n\n)
-                        while b"\n\n" in sse_buffer:
-                            event_raw, sse_buffer = sse_buffer.split(b"\n\n", 1)
-                            lines = event_raw.decode("utf-8", errors="replace").split("\n")
+                # Parse SSE stream manually (avoid aiohttp line-size limit of 128KB)
+                # base64 audio data in SSE can easily exceed that limit
+                sse_buffer = b""
+                current_event = None
+                async for chunk in resp.content.iter_any():
+                    sse_buffer += chunk
+                    # Process complete SSE messages (delimited by \n\n)
+                    while b"\n\n" in sse_buffer:
+                        event_raw, sse_buffer = sse_buffer.split(b"\n\n", 1)
+                        lines = event_raw.decode("utf-8", errors="replace").split("\n")
 
-                            for line in lines:
-                                line = line.rstrip("\r")
-                                if line.startswith("event: "):
-                                    current_event = line[7:]
-                                elif line.startswith("data: "):
-                                    if current_event == "audio":
-                                        try:
-                                            data = json.loads(line[6:])
-                                            audio_b64 = data.get("audio", "")
-                                            if not audio_b64:
-                                                continue
-
-                                            # Decode base64 -> raw int16 PCM 32kHz
-                                            pcm_32k = base64.b64decode(audio_b64)
-
-                                            # Resample 32kHz -> 24kHz
-                                            pcm_24k = self._resample_32k_to_24k(pcm_32k)
-
-                                            if pcm_24k:
-                                                if not first_chunk_logged:
-                                                    latency_ms = (time.time() - t_tts_sent) * 1000
-                                                    logger.info(
-                                                        f'[TRACE] gsv_tts_first_chunk: latency={latency_ms:.1f}ms, '
-                                                        f'text="{text[:30]}"'
-                                                    )
-                                                    first_chunk_logged = True
-                                                yield pcm_24k
-
-                                        except (json.JSONDecodeError, Exception) as e:
-                                            logger.warning(f"GSV-TTS SSE audio parse error: {e}")
+                        for line in lines:
+                            line = line.rstrip("\r")
+                            if line.startswith("event: "):
+                                current_event = line[7:]
+                            elif line.startswith("data: "):
+                                if current_event == "audio":
+                                    try:
+                                        data = json.loads(line[6:])
+                                        audio_b64 = data.get("audio", "")
+                                        if not audio_b64:
                                             continue
 
-                                    elif current_event == "error":
-                                        try:
-                                            data = json.loads(line[6:])
-                                            logger.error(f'GSV-TTS SSE error: {data.get("error", "unknown")}')
-                                        except json.JSONDecodeError:
-                                            logger.error(f"GSV-TTS SSE error (raw): {line[6:]}")
-                                        return
+                                        # Decode base64 -> raw int16 PCM 32kHz
+                                        pcm_32k = base64.b64decode(audio_b64)
 
-                                    elif current_event == "done":
-                                        return
+                                        # Resample 32kHz -> 24kHz
+                                        pcm_24k = self._resample_32k_to_24k(pcm_32k)
 
-            except asyncio.CancelledError:
-                logger.info("[GSV-TTS] stream_tts cancelled")
-                raise
-            except Exception as e:
-                logger.error(f"GSV-TTS streaming error: {e}")
+                                        if pcm_24k:
+                                            if not first_chunk_logged:
+                                                latency_ms = (time.time() - t_tts_sent) * 1000
+                                                logger.info(
+                                                    f'[TRACE] gsv_tts_first_chunk: latency={latency_ms:.1f}ms, '
+                                                    f'text="{text[:30]}"'
+                                                )
+                                                first_chunk_logged = True
+                                            yield pcm_24k
+
+                                    except (json.JSONDecodeError, Exception) as e:
+                                        logger.warning(f"GSV-TTS SSE audio parse error: {e}")
+                                        continue
+
+                                elif current_event == "error":
+                                    try:
+                                        data = json.loads(line[6:])
+                                        logger.error(f'GSV-TTS SSE error: {data.get("error", "unknown")}')
+                                    except json.JSONDecodeError:
+                                        logger.error(f"GSV-TTS SSE error (raw): {line[6:]}")
+                                    return
+
+                                elif current_event == "done":
+                                    return
+
+        except asyncio.CancelledError:
+            logger.info("[GSV-TTS] stream_tts cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"GSV-TTS streaming error: {e}")
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None

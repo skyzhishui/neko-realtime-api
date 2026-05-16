@@ -55,6 +55,13 @@ class TTSPipeline:
         self.sample_rate_out = sample_rate_out
         self.tts_sample_rate = 24000  # Qwen3-TTS fixed output 24kHz
         self.timeout_s = timeout_s
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
 
     @staticmethod
     def _is_punctuation_only(text: str) -> bool:
@@ -84,42 +91,47 @@ class TTSPipeline:
         first_chunk_logged = False
         wav_header_skipped = False
         leftover = b""
-        timeout = aiohttp.ClientTimeout(total=self.timeout_s)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                async with session.post(
-                    f"{self.base_url}/v1/audio/speech",
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"TTS error {resp.status}: {error_text[:500]}")
-                        return
+        session = await self._get_session()
+        try:
+            async with session.post(
+                f"{self.base_url}/v1/audio/speech",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.timeout_s),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"TTS error {resp.status}: {error_text[:500]}")
+                    return
+                
+                async for chunk in resp.content.iter_chunked(4096):
+                    if not wav_header_skipped:
+                        if len(chunk) > 44:
+                            chunk = chunk[44:]
+                        else:
+                            continue
+                        wav_header_skipped = True
                     
-                    async for chunk in resp.content.iter_chunked(4096):
-                        if not wav_header_skipped:
-                            if len(chunk) > 44:
-                                chunk = chunk[44:]
-                            else:
-                                continue
-                            wav_header_skipped = True
-                        
-                        chunk = leftover + chunk
-                        leftover = b""
+                    chunk = leftover + chunk
+                    leftover = b""
 
-                        if len(chunk) % 2 != 0:
-                            leftover = chunk[-1:]
-                            chunk = chunk[:-1]
+                    if len(chunk) % 2 != 0:
+                        leftover = chunk[-1:]
+                        chunk = chunk[:-1]
 
-                        if chunk:
-                            if not first_chunk_logged:
-                                latency_ms = (time.time() - t_tts_sent) * 1000
-                                logger.info(f'[TRACE] tts_first_chunk: latency={latency_ms:.1f}ms, text="{text[:30]}"')
-                                first_chunk_logged = True
-                            yield chunk
+                    if chunk:
+                        if not first_chunk_logged:
+                            latency_ms = (time.time() - t_tts_sent) * 1000
+                            logger.info(f'[TRACE] tts_first_chunk: latency={latency_ms:.1f}ms, text="{text[:30]}"')
+                            first_chunk_logged = True
+                        yield chunk
 
-            except Exception as e:
-                logger.error(f"TTS streaming error: {e}")
+        except Exception as e:
+            logger.error(f"TTS streaming error: {e}")
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
 
 

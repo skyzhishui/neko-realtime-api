@@ -566,11 +566,12 @@ class SileroVADModule:
         )
         
         # Buffer for accumulating small frames to reach CHUNK_SIZE
-        self._sample_buffer = np.array([], dtype=np.float32)
+        # Uses deque of numpy arrays for O(1) append instead of O(N) np.concatenate
+        self._sample_chunks = deque()
         
         # ---- Smart Turn 话轮检测 ----
         self._smart_turn = None  # SmartTurnDetector 实例
-        self._turn_audio_buffer = np.array([], dtype=np.float32)  # 语音期音频累积
+        self._turn_audio_chunks = []  # list of numpy arrays, concatenated only on demand
         
         if self.smart_turn_enabled:
             self._init_smart_turn()
@@ -713,10 +714,10 @@ class SileroVADModule:
             maxlen=int(prefix_padding_ms / (cls.CHUNK_SIZE / sample_rate * 1000))
         )
         
-        instance._sample_buffer = np.array([], dtype=np.float32)
+        instance._sample_chunks = deque()
         
         # ---- Smart Turn (from preloaded artifacts) ----
-        instance._turn_audio_buffer = np.array([], dtype=np.float32)
+        instance._turn_audio_chunks = []
         
         if smart_turn_enabled and smart_turn_onnx_session is not None:
             instance._smart_turn = SmartTurnDetector.from_preloaded(
@@ -972,7 +973,7 @@ class SileroVADModule:
         """Reset VAD state."""
         self.is_speaking = False
         self.prefix_chunks.clear()
-        self._sample_buffer = np.array([], dtype=np.float32)
+        self._sample_chunks.clear()
         
         # min_speech_duration 状态重置
         self._speech_candidate_frames = 0
@@ -985,7 +986,7 @@ class SileroVADModule:
         self._silence_timeout_count = 0
         
         # Smart Turn 音频缓冲重置
-        self._turn_audio_buffer = np.array([], dtype=np.float32)
+        self._turn_audio_chunks = []
         
         # ONNX 状态重置
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
@@ -1120,12 +1121,13 @@ class SileroVADModule:
             # Smart Turn 未启用，默认 Complete
             return True
         
-        if len(self._turn_audio_buffer) == 0:
+        if len(self._turn_audio_chunks) == 0:
             # 没有累积音频，默认 Complete
-            logger.warning("[SmartTurn] _turn_audio_buffer 为空，默认判定 Complete")
+            logger.warning("[SmartTurn] _turn_audio_chunks 为空，默认判定 Complete")
             return True
         
-        result = self._smart_turn.predict_endpoint(self._turn_audio_buffer)
+        turn_audio = np.concatenate(self._turn_audio_chunks)
+        result = self._smart_turn.predict_endpoint(turn_audio)
         
         if result["prediction"] == 1:
             # Complete: 用户说完了
@@ -1167,16 +1169,28 @@ class SileroVADModule:
         
         audio_np = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
-        # Append to buffer
-        self._sample_buffer = np.concatenate([self._sample_buffer, audio_np])
+        # Append to chunk buffer (O(1))
+        self._sample_chunks.append(audio_np)
         
         events = []
         frame_ms = self.CHUNK_SIZE / self.sample_rate * 1000  # 32ms per frame
         
         # Process complete chunks from buffer
-        while len(self._sample_buffer) >= self.CHUNK_SIZE:
-            chunk = self._sample_buffer[:self.CHUNK_SIZE]
-            self._sample_buffer = self._sample_buffer[self.CHUNK_SIZE:]
+        while True:
+            total = sum(len(c) for c in self._sample_chunks)
+            if total < self.CHUNK_SIZE:
+                break
+            collected = []
+            avail = 0
+            while self._sample_chunks and avail < self.CHUNK_SIZE:
+                c = self._sample_chunks.popleft()
+                collected.append(c)
+                avail += len(c)
+            flat = np.concatenate(collected) if len(collected) > 1 else collected[0]
+            chunk = flat[:self.CHUNK_SIZE]
+            remainder = flat[self.CHUNK_SIZE:]
+            if len(remainder) > 0:
+                self._sample_chunks.appendleft(remainder)
             
             # VAD 检测
             speech_prob = self._detect_frame(chunk)
@@ -1204,7 +1218,7 @@ class SileroVADModule:
                         # Smart Turn: 开始累积语音期音频（包含 prefix 中的候选帧）
                         if self.smart_turn_enabled and self._smart_turn is not None:
                             prefix_np = np.concatenate(list(self.prefix_chunks))
-                            self._turn_audio_buffer = prefix_np.copy()
+                            self._turn_audio_chunks = [prefix_np.copy()]
                         
                         # 埋点: speech_started
                         self._speech_start_time = time.monotonic()
@@ -1229,7 +1243,7 @@ class SileroVADModule:
                 
                 # Smart Turn: 累积语音期音频（所有帧，包括静音帧，保持连续性）
                 if self.smart_turn_enabled and self._smart_turn is not None:
-                    self._turn_audio_buffer = np.concatenate([self._turn_audio_buffer, chunk])
+                    self._turn_audio_chunks.append(chunk)
                 
                 if speech_prob >= self.threshold:
                     # 仍在说话
@@ -1267,13 +1281,13 @@ class SileroVADModule:
                             self._silence_timeout_count = 0
                             self._speech_start_time = None
                             self._last_silence_start_time = None
-                            self._turn_audio_buffer = np.array([], dtype=np.float32)
+                            self._turn_audio_chunks = []
                             events.append("speech_stopped")
                         else:
                             # Incomplete: 用户还在思考 → 重置静音计数，继续等待
                             self._silence_timeout_count = 0
                             self._last_silence_start_time = None
-                            # 注意: 不重置 _turn_audio_buffer，继续累积
+                            # 注意: 不重置 _turn_audio_chunks，继续累积
                             # 注意: 不触发任何事件
                     else:
                         # Smart Turn 未启用，直接触发 speech_stopped（原始逻辑）
@@ -1314,7 +1328,7 @@ class SileroVADModule:
                     self._silence_timeout_count = 0
                     self._speech_start_time = None
                     self._last_silence_start_time = None
-                    self._turn_audio_buffer = np.array([], dtype=np.float32)
+                    self._turn_audio_chunks = []
                     events.append("speech_stopped")
                     events.append("max_duration_reached")
         
@@ -1337,9 +1351,10 @@ class SileroVADModule:
         Returns:
             PCM16 bytes of the current speech turn, or empty bytes if no speech.
         """
-        if len(self._turn_audio_buffer) == 0:
+        if not self._turn_audio_chunks:
             return b""
-        return (self._turn_audio_buffer * 32768.0).astype(np.int16).tobytes()
+        turn_audio = np.concatenate(self._turn_audio_chunks)
+        return (turn_audio * 32768.0).astype(np.int16).tobytes()
 
     @property
     def vad_backend(self) -> str:

@@ -18,6 +18,13 @@ class SenseVoiceASRClient:
 
     def __init__(self, base_url: str = "http://localhost:8082"):
         self.base_url = base_url
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
 
     async def transcribe_http(
         self, pcm_bytes: bytes, sample_rate: int = 16000, language: str = "zh"
@@ -28,29 +35,29 @@ class SenseVoiceASRClient:
         """
         wav_bytes = self._pcm_to_wav(pcm_bytes, sample_rate)
         
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            data = aiohttp.FormData()
-            data.add_field(
-                "file", wav_bytes, filename="audio.wav", content_type="audio/wav"
-            )
-            data.add_field("model", "SenseVoiceSmall")
-            data.add_field("language", language)
-            
-            try:
-                async with session.post(
-                    f"{self.base_url}/v1/audio/transcriptions",
-                    data=data,
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"ASR error {resp.status}: {error_text[:500]}")
-                        return ""
-                    result = await resp.json()
-                    return result.get("text", "")
-            except Exception as e:
-                logger.error(f"ASR HTTP error: {e}")
-                return ""
+        session = await self._get_session()
+        data = aiohttp.FormData()
+        data.add_field(
+            "file", wav_bytes, filename="audio.wav", content_type="audio/wav"
+        )
+        data.add_field("model", "SenseVoiceSmall")
+        data.add_field("language", language)
+        
+        try:
+            async with session.post(
+                f"{self.base_url}/v1/audio/transcriptions",
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"ASR error {resp.status}: {error_text[:500]}")
+                    return ""
+                result = await resp.json()
+                return result.get("text", "")
+        except Exception as e:
+            logger.error(f"ASR HTTP error: {e}")
+            return ""
 
     async def transcribe_ws(
         self, pcm_chunks: AsyncIterator[bytes]
@@ -93,3 +100,8 @@ class SenseVoiceASRClient:
             wf.setframerate(sample_rate)
             wf.writeframes(pcm_bytes)
         return buf.getvalue()
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None

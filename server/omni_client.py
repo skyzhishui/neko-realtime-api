@@ -17,6 +17,13 @@ class OmniAudioClient:
     def __init__(self, base_url: str = "http://localhost:8000", model: str = "Qwen3-Omni"):
         self.base_url = base_url
         self.model = model
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=10, keepalive_timeout=30)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
 
     async def stream_chat(
         self,
@@ -51,43 +58,43 @@ class OmniAudioClient:
         t_request_sent = time.time()
         first_token_logged = False
 
-        timeout = aiohttp.ClientTimeout(total=timeout_s)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                async with session.post(
-                    f"{self.base_url}/v1/chat/completions",
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"Omni API error {resp.status}: {error_text[:500]}")
-                        raise Exception(f"Omni API error {resp.status}: {error_text[:200]}")
-                    
-                    async for line in resp.content:
-                        line = line.decode().strip()
-                        if not line.startswith("data: "):
-                            continue
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                # [TRACE] 首 token 埋点
-                                if not first_token_logged:
-                                    first_token_logged = True
-                                    latency_ms = (time.time() - t_request_sent) * 1000
-                                    first_content_preview = content[:20].replace("\n", " ")
-                                    logger.info(f'[TRACE] llm_first_token: latency={latency_ms:.0f}ms, first_content="{first_content_preview}"')
-                                yield content
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse Omni SSE chunk: {data[:200]}")
-                            continue
-            except aiohttp.ClientError as e:
-                logger.error(f"Omni client error: {e}")
-                raise
+        session = await self._get_session()
+        try:
+            async with session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"Omni API error {resp.status}: {error_text[:500]}")
+                    raise Exception(f"Omni API error {resp.status}: {error_text[:200]}")
+                
+                async for line in resp.content:
+                    line = line.decode().strip()
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            # [TRACE] 首 token 埋点
+                            if not first_token_logged:
+                                first_token_logged = True
+                                latency_ms = (time.time() - t_request_sent) * 1000
+                                first_content_preview = content[:20].replace("\n", " ")
+                                logger.info(f'[TRACE] llm_first_token: latency={latency_ms:.0f}ms, first_content="{first_content_preview}"')
+                            yield content
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse Omni SSE chunk: {data[:200]}")
+                        continue
+        except aiohttp.ClientError as e:
+            logger.error(f"Omni client error: {e}")
+            raise
 
     def build_audio_message(self, wav_b64: str) -> dict:
         """Build audio input message (recommended format)."""
@@ -115,3 +122,8 @@ class OmniAudioClient:
             "type": "text",
             "text": text,
         }
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None

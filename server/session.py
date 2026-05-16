@@ -16,6 +16,7 @@ import json
 import logging
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator
 
 import numpy as np
@@ -217,6 +218,9 @@ class RealtimeSession:
         # 打断时调用 _cancel_active_pipeline() 取消旧pipeline
         self._active_pipeline_task: asyncio.Task | None = None
 
+        # ---- VAD offload executor ----
+        self._vad_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad")
+
     async def handle_event(self, event: dict):
         """Handle incoming client event."""
         event_type = event.get("type", "")
@@ -301,8 +305,9 @@ class RealtimeSession:
             logger.warning(f"Failed to decode audio: {e}")
             return
         
-        # VAD processing
-        vad_events = self.vad.process(pcm_bytes)
+        # VAD processing (offloaded to avoid blocking event loop)
+        loop = asyncio.get_running_loop()
+        vad_events = await loop.run_in_executor(self._vad_executor, self.vad.process, pcm_bytes)
         
         for vad_event in vad_events:
             if vad_event == "speech_started":
@@ -350,7 +355,7 @@ class RealtimeSession:
                         all_audio_pcm = self.audio_buffer.get_full_pcm()
                         if len(all_audio_pcm) > 0:
                             turn_audio_np = np.frombuffer(all_audio_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                            self.vad._turn_audio_buffer = turn_audio_np.copy()
+                            self.vad._turn_audio_chunks = [turn_audio_np.copy()]
                             
                             #turn_ms = len(turn_audio_np) / self.vad.sample_rate * 1000
                             #logger.info(
@@ -399,28 +404,29 @@ class RealtimeSession:
     async def _cancel_active_pipeline(self, reason: str):
         """取消当前活跃的pipeline task。
         
-        通过 asyncio.Task.cancel() 触发 CancelledError 传播到整个pipeline：
-        LLM stream → TTS HTTP/WS → audio output
-        
-        CancelledError 会在每个 await 点被触发，实现真正的即时取消。
-        
-        Args:
-            reason: 取消原因，用于日志记录
+        通过 asyncio.Task.cancel() 触发 CancelledError 传播到整个pipeline。
+        不在打断路径上 await 被取消的 task，避免 ONNX 推理中途的同步等待。
         """
         if self._active_pipeline_task is not None and not self._active_pipeline_task.done():
             logger.info(
                 f"[Session] Cancelling active pipeline task (reason={reason}), "
                 f"task_done={self._active_pipeline_task.done()}"
             )
-            self._active_pipeline_task.cancel()
-            try:
-                await self._active_pipeline_task
-            except asyncio.CancelledError:
-                logger.info("[Session] Active pipeline task cancelled successfully (CancelledError propagated)")
-            except Exception as e:
-                logger.warning(f"[Session] Active pipeline task cancellation error: {e}")
-            finally:
-                self._active_pipeline_task = None
+            task = self._active_pipeline_task
+            self._active_pipeline_task = None
+            task.cancel()
+            # Fire-and-forget: await the task in background to ensure
+            # CancelledError is consumed and resources are cleaned up,
+            # but don't block the interruption path.
+            async def _cleanup_cancelled_task(t: asyncio.Task):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    logger.info("[Session] Active pipeline task cancelled successfully (background cleanup)")
+                except Exception as e:
+                    logger.warning(f"[Session] Active pipeline task cancellation error (background cleanup): {e}")
+            
+            asyncio.create_task(_cleanup_cancelled_task(task))
         
         # 同时确保interruption状态也被清理
         # 这样pipeline内部的 should_cancel() 检查也能生效（作为辅助检查）
@@ -495,22 +501,51 @@ class RealtimeSession:
             return await self._stream_llm_to_tts_http(messages, resp_id)
 
     async def _stream_llm_to_tts_http(self, messages: list[dict], resp_id: str):
-        """HTTP 模式：分句 → 逐句 HTTP TTS。
+        """HTTP 模式：分句 → 逐句 HTTP TTS（流水线并行版）。
         
-        重写要点：
-        - 去掉所有 should_cancel() 检查
-        - 利用 CancelledError 传播实现即时取消
-        - CancelledError 会在所有 await 点被触发
-        - aiohttp 的 async with / async for 会正确传播 CancelledError
+        改进：句子级流水线 — 句子 N+1 的 TTS 请求在句子 N 音频接收期间即可启动，
+        通过 asyncio.Semaphore 限制并发数，音频按句子顺序输出。
         """
-        # C1 fix: 每次 TTS 调用前同步 voice
         self.tts_pipeline.voice = self.session_config.voice
         full_text = ""
         splitter = SentenceSplitter(
             min_sub_sentence_len=self.config.get("tts_pipeline", "min_sub_sentence_len", default=6)
         )
+        max_concurrent = self.config.get("tts_pipeline", "max_concurrent_tts", default=2)
+        tts_semaphore = asyncio.Semaphore(max_concurrent)
+
+        # 每个句子的音频队列（按句子顺序）
+        sentence_audio_queues: list[asyncio.Queue[bytes | None]] = []
+        # 跟踪所有 TTS 任务
+        tts_tasks: list[asyncio.Task] = []
+
+        async def _process_sentence_tts(sentence: str, queue: asyncio.Queue):
+            """单个句子的 TTS 处理：获取 semaphore → 请求 TTS → 推入队列。"""
+            async with tts_semaphore:
+                tts_pipe = self.gsv_tts_pipeline if self.gsv_tts_enabled else self.tts_pipeline
+                try:
+                    async for pcm_chunk in tts_pipe.stream_tts(
+                        sentence,
+                        **({} if self.gsv_tts_enabled else {"instructions": ""}),
+                    ):
+                        await queue.put(pcm_chunk)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"TTS error for sentence: {e}", exc_info=True)
+                finally:
+                    await queue.put(None)  # Sentinel: this sentence's audio is done
+
+        async def _drain_queue(queue: asyncio.Queue):
+            """从队列中读取所有音频块并发送给客户端。"""
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                await self.protocol.send_audio_delta(chunk)
 
         try:
+            # Phase 1: LLM streaming + pipelined TTS
             async for text_delta in self.omni_client.stream_chat(
                 messages=messages,
                 temperature=self.session_config.temperature,
@@ -524,28 +559,35 @@ class RealtimeSession:
                 sentences = splitter.add_text(text_delta)
                 for sentence in sentences:
                     logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}')
-                    tts_pipe = self.gsv_tts_pipeline if self.gsv_tts_enabled else self.tts_pipeline
-                    async for pcm_chunk in tts_pipe.stream_tts(
-                        sentence,
-                        **({} if self.gsv_tts_enabled else {"instructions": ""}),
-                    ):
-                        await self.protocol.send_audio_delta(pcm_chunk)
+                    q = asyncio.Queue()
+                    sentence_audio_queues.append(q)
+                    task = asyncio.create_task(_process_sentence_tts(sentence, q))
+                    tts_tasks.append(task)
 
-            # Flush remaining sentences
+            # Phase 2: Flush remaining sentences
             for sentence in splitter.flush():
                 logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}(flush)')
-                tts_pipe = self.gsv_tts_pipeline if self.gsv_tts_enabled else self.tts_pipeline
-                async for pcm_chunk in tts_pipe.stream_tts(
-                    sentence,
-                    **({} if self.gsv_tts_enabled else {"instructions": ""}),
-                ):
-                    await self.protocol.send_audio_delta(pcm_chunk)
+                q = asyncio.Queue()
+                sentence_audio_queues.append(q)
+                task = asyncio.create_task(_process_sentence_tts(sentence, q))
+                tts_tasks.append(task)
+
+            # Phase 3: Drain all sentence audio queues IN ORDER
+            for q in sentence_audio_queues:
+                await _drain_queue(q)
+
+            # Wait for all TTS tasks to complete (they should be done after queues drained)
+            if tts_tasks:
+                await asyncio.gather(*tts_tasks, return_exceptions=True)
 
         except asyncio.CancelledError:
             # Pipeline 被取消（用户打断），CancelledError 已传播到此处
-            # aiohttp 的 ClientSession 和连接会在 CancelledError 传播时自动清理
             logger.info("[Session] HTTP TTS pipeline cancelled (CancelledError propagated)")
-            raise  # 重新抛出，让 _process_speech_input 处理
+            # Cancel all pending TTS tasks
+            for task in tts_tasks:
+                if not task.done():
+                    task.cancel()
+            raise
 
         return full_text
 
@@ -962,3 +1004,11 @@ class RealtimeSession:
         self.audio_buffer.reset()
         self.vad.reset()
         self.conversation.clear()
+        
+        await self.omni_client.close()
+        await self.asr_client.close()
+        await self.tts_pipeline.close()
+        if self.gsv_tts_pipeline:
+            await self.gsv_tts_pipeline.close()
+        
+        self._vad_executor.shutdown(wait=False)
