@@ -505,6 +505,13 @@ class RealtimeSession:
         
         改进：句子级流水线 — 句子 N+1 的 TTS 请求在句子 N 音频接收期间即可启动，
         通过 asyncio.Semaphore 限制并发数，音频按句子顺序输出。
+        
+        关键设计：
+        1. TTS 任务通过 audio_ready_event 通知 drain 有新音频可用，
+           不再仅依赖 LLM delta 触发 drain（LLM 结束后 drain 仍可被唤醒）。
+        2. Phase 3 的阻塞 drain 对 CancelledError 有容错：
+           被取消时仍尝试非阻塞地排空已就绪的音频，避免音频丢失。
+        3. 队列设置 maxsize 防止 TTS 产出过快导致内存膨胀。
         """
         self.tts_pipeline.voice = self.session_config.voice
         full_text = ""
@@ -514,10 +521,14 @@ class RealtimeSession:
         max_concurrent = self.config.get("tts_pipeline", "max_concurrent_tts", default=2)
         tts_semaphore = asyncio.Semaphore(max_concurrent)
 
-        # 每个句子的音频队列（按句子顺序）
+        # 每个句子的音频队列（按句子顺序），有界队列防止内存膨胀
         sentence_audio_queues: list[asyncio.Queue[bytes | None]] = []
         # 跟踪所有 TTS 任务
         tts_tasks: list[asyncio.Task] = []
+        # 下一个要 drain 的句子队列索引
+        next_drain_idx = 0
+        # TTS 产出音频时触发，让 Phase 1 的 drain 能及时响应
+        audio_ready_event = asyncio.Event()
 
         async def _process_sentence_tts(sentence: str, queue: asyncio.Queue):
             """单个句子的 TTS 处理：获取 semaphore → 请求 TTS → 推入队列。"""
@@ -529,23 +540,74 @@ class RealtimeSession:
                         **({} if self.gsv_tts_enabled else {"instructions": ""}),
                     ):
                         await queue.put(pcm_chunk)
+                        audio_ready_event.set()
                 except asyncio.CancelledError:
+                    # 被取消时仍需发送 sentinel，防止 drain task 永久阻塞
+                    await queue.put(None)
+                    audio_ready_event.set()
                     raise
                 except Exception as e:
                     logger.error(f"TTS error for sentence: {e}", exc_info=True)
-                finally:
-                    await queue.put(None)  # Sentinel: this sentence's audio is done
+                    await queue.put(None)
+                    audio_ready_event.set()
 
-        async def _drain_queue(queue: asyncio.Queue):
-            """从队列中读取所有音频块并发送给客户端。"""
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                await self.protocol.send_audio_delta(chunk)
+        async def _drain_ready_queues():
+            """非阻塞地消费已就绪的音频队列，按句子顺序输出。
+            
+            对当前 drain 指针指向的队列，持续取 chunk 直到队列暂时为空
+            或收到 sentinel（None）。遇到空队列时立即返回，不阻塞等待。
+            """
+            nonlocal next_drain_idx
+            while next_drain_idx < len(sentence_audio_queues):
+                q = sentence_audio_queues[next_drain_idx]
+                while True:
+                    try:
+                        chunk = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    if chunk is None:
+                        break
+                    await self.protocol.send_audio_delta(chunk)
+                next_drain_idx += 1
+
+        async def _drain_remaining_blocking():
+            """阻塞等待并排空所有剩余队列（Phase 3）。
+            
+            对 CancelledError 容错：被取消时仍尝试非阻塞地发送已就绪的音频，
+            而不是直接丢弃。这确保即使 pipeline 被打断（如用户新一轮语音），
+            已产出的 TTS 音频仍能送达客户端。
+            """
+            nonlocal next_drain_idx
+            while next_drain_idx < len(sentence_audio_queues):
+                q = sentence_audio_queues[next_drain_idx]
+                while True:
+                    try:
+                        chunk = await q.get()
+                    except asyncio.CancelledError:
+                        logger.info(
+                            f"[Session] Phase 3 drain cancelled at sentence {next_drain_idx}, "
+                            f"draining available chunks non-blocking"
+                        )
+                        while True:
+                            try:
+                                remaining = q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                return
+                            if remaining is None:
+                                break
+                            try:
+                                await self.protocol.send_audio_delta(remaining)
+                            except (asyncio.CancelledError, Exception):
+                                return
+                        next_drain_idx += 1
+                        continue
+                    if chunk is None:
+                        break
+                    await self.protocol.send_audio_delta(chunk)
+                next_drain_idx += 1
 
         try:
-            # Phase 1: LLM streaming + pipelined TTS
+            # Phase 1: LLM streaming + pipelined TTS + event-driven audio drain
             async for text_delta in self.omni_client.stream_chat(
                 messages=messages,
                 temperature=self.session_config.temperature,
@@ -559,22 +621,35 @@ class RealtimeSession:
                 sentences = splitter.add_text(text_delta)
                 for sentence in sentences:
                     logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}')
-                    q = asyncio.Queue()
+                    q = asyncio.Queue(maxsize=50)
                     sentence_audio_queues.append(q)
                     task = asyncio.create_task(_process_sentence_tts(sentence, q))
                     tts_tasks.append(task)
 
-            # Phase 2: Flush remaining sentences
+                # 每次 LLM delta 后 drain 已就绪的队列
+                await _drain_ready_queues()
+
+                # 如果 TTS 已产出音频但 LLM delta 间隔较长，
+                # 通过 event 等待一小段时间让 drain 有机会处理
+                if audio_ready_event.is_set():
+                    audio_ready_event.clear()
+                    await _drain_ready_queues()
+
+            # Phase 2: Flush remaining sentences from splitter
             for sentence in splitter.flush():
                 logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}(flush)')
-                q = asyncio.Queue()
+                q = asyncio.Queue(maxsize=50)
                 sentence_audio_queues.append(q)
                 task = asyncio.create_task(_process_sentence_tts(sentence, q))
                 tts_tasks.append(task)
 
-            # Phase 3: Drain all sentence audio queues IN ORDER
-            for q in sentence_audio_queues:
-                await _drain_queue(q)
+            logger.info(
+                f"[Session] Phase 3 starting: {len(sentence_audio_queues)} sentences, "
+                f"next_drain_idx={next_drain_idx}"
+            )
+
+            # Phase 3: 阻塞等待所有剩余队列完成（LLM 已结束，TTS task 全部启动）
+            await _drain_remaining_blocking()
 
             # Wait for all TTS tasks to complete (they should be done after queues drained)
             if tts_tasks:
