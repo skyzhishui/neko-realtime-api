@@ -542,12 +542,10 @@ class RealtimeSession:
                         await queue.put(pcm_chunk)
                         audio_ready_event.set()
                 except asyncio.CancelledError:
-                    # 被取消时仍需发送 sentinel，防止 drain task 永久阻塞
-                    await queue.put(None)
-                    audio_ready_event.set()
                     raise
                 except Exception as e:
                     logger.error(f"TTS error for sentence: {e}", exc_info=True)
+                finally:
                     await queue.put(None)
                     audio_ready_event.set()
 
