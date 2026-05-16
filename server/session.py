@@ -329,8 +329,9 @@ class RealtimeSession:
                     # 4. 把预缓冲数据存下来
                     prefix_audio = self.vad.get_prefix_audio()
 
-                    # 5. 清空旧的 audio_buffer
+                    # 5. 清空旧的 audio_buffer（包括残留的图片数据）
                     self.audio_buffer.clear_audio()
+                    self.audio_buffer.clear_images()
                     
                     # 6. 先写回预缓冲音频（用户语音起始前的~300ms），再写当前帧                    
                     if prefix_audio:
