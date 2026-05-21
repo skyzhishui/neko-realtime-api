@@ -148,6 +148,7 @@ class RealtimeSession:
         self.omni_client = OmniAudioClient(
             base_url=config.get("services", "omni", "base_url", default="http://localhost:8000/v1"),
             model=config.get("services", "omni", "model", default="Qwen3-Omni-30B-A3B-Instruct-AWQ-8bit"),
+            api_key=config.get("services", "omni", "api_key", default=None),
         )
         
         self.asr_client = SenseVoiceASRClient(
@@ -172,6 +173,7 @@ class RealtimeSession:
             voice=self.session_config.voice,  # C1 fix: 使用 session_config.voice
             sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
             timeout_s=config.get("services", "tts", "timeout_s", default=15),
+            api_key=config.get("services", "tts", "api_key", default=None),
         )
         
         # GSV-TTS-Lite pipeline (optional, voice cloning TTS)
@@ -624,6 +626,7 @@ class RealtimeSession:
             sample_rate=self.config.get("services", "tts", "sample_rate", default=24000),
             language=self.config.get("services", "tts", "language", default="Chinese"),
             timeout_s=self.config.get("services", "tts", "timeout_s", default=15),
+            api_key=self.config.get("services", "tts", "api_key", default=None),
         )
 
         # 并行音频接收任务的状态

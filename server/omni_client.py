@@ -14,9 +14,10 @@ class OmniAudioClient:
     Endpoint: POST http://localhost:8000/v1/chat/completions
     """
 
-    def __init__(self, base_url: str = "http://localhost:8000", model: str = "Qwen3-Omni"):
+    def __init__(self, base_url: str = "http://localhost:8000", model: str = "Qwen3-Omni", api_key: str | None = None):
         self.base_url = base_url
         self.model = model
+        self.api_key = api_key
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -59,10 +60,14 @@ class OmniAudioClient:
         first_token_logged = False
 
         session = await self._get_session()
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
             async with session.post(
                 f"{self.base_url}/chat/completions",
                 json=payload,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout_s),
             ) as resp:
                 if resp.status != 200:

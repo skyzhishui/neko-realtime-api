@@ -31,6 +31,7 @@ _DEFAULT_CONFIG = {
         "omni": {
             "base_url": "http://localhost:8000",
             "model": "Qwen3-Omni",
+            "api_key": None,
             "timeout_s": 30,
             "max_tokens": 4096,
             "temperature": 0.7,
@@ -50,6 +51,7 @@ _DEFAULT_CONFIG = {
             "ws_url": "ws://localhost:8091/v1/audio/speech/stream",
             "mode": "http",
             "model": "Qwen3-TTS",
+            "api_key": None,
             "voice": "Vivian",
             "response_format": "pcm",
             "stream": True,

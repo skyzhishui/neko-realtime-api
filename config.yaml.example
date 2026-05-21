@@ -102,6 +102,11 @@ services:
     # 模型名称，需与后端实际部署的模型一致
     model: Qwen3.6-35B-A3B
 
+    # API Key（可选），用于 OpenAI 兼容接口认证
+    # 设为 null 或不设置则不发送 Authorization 头（适用于内网无认证部署）
+    # 设为字符串则自动添加 Authorization: Bearer <api_key> 头
+    api_key: null
+
     # 请求超时时间（秒）
     timeout_s: 30
 
@@ -165,6 +170,12 @@ services:
 
     # TTS 模型名称
     model: Qwen3-TTS
+
+    # API Key（可选），用于 OpenAI 兼容接口认证
+    # 设为 null 或不设置则不发送 Authorization 头（适用于内网无认证部署）
+    # 设为字符串则自动添加 Authorization: Bearer <api_key> 头
+    # HTTP 模式和 WebSocket 模式均使用此 key
+    api_key: null
 
     # 默认音色名称（可被客户端 session.update 覆盖）
     # 取决于 TTS 后端支持的音色

@@ -46,9 +46,12 @@ cp config.yaml.example config.yaml
 | `realtime_server.default_mode` | 默认工作模式 | `asr_llm` |
 | `realtime_server.auth_enabled` | 是否启用认证 | `false` |
 | `services.omni.base_url` | Omni 模型 API 地址 | `http://localhost:8000/v1` |
+| `services.omni.api_key` | Omni API Key（可选，null 则不发送） | `null` |
 | `services.asr.local_asr` | 是否使用本地 ASR | `true` |
 | `services.tts.base_url` | TTS HTTP API 地址 | `http://localhost:8091/v1` |
+| `services.tts.api_key` | TTS API Key（可选，null 则不发送，HTTP/WS 共用） | `null` |
 | `services.tts.mode` | TTS 调用模式 (`http`/`ws`) | `http` |
+| `services.tts.api_key` | TTS API Key（可选，null 则不发送，HTTP/WS 共用） | `null` |
 | `services.gsv_tts.enabled` | 是否启用 GSV-TTS-Lite 语音合成 | `false` |
 
 > 详细配置说明见 `config.yaml.example`，每项均有中文注释。
@@ -155,7 +158,7 @@ asyncio.run(main())
 | GSV-TTS-Lite | 语音克隆 TTS（可选） | `http://localhost:8001` |
 | 远程 ASR | 语音识别（local_asr=false 时） | `http://localhost:8082/v1` |
 
-Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。`base_url` 配置项需包含 `/v1` 路径前缀（如 `http://localhost:8000/v1`）。
+Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。`base_url` 配置项需包含 `/v1` 路径前缀（如 `http://localhost:8000/v1`）。当后端服务需要认证时，可在 `config.yaml` 中设置 `services.omni.api_key` 和 `services.tts.api_key`，服务会自动在请求头中添加 `Authorization: Bearer <api_key>`。设为 `null` 则不发送认证头，适用于内网无认证部署。
 
 ## License
 

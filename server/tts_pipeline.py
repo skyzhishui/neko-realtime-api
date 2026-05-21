@@ -49,12 +49,14 @@ class TTSPipeline:
         voice: str = "Vivian",
         sample_rate_out: int = 24000,
         timeout_s: int = 15,
+        api_key: str | None = None,
     ):
         self.base_url = base_url
         self.voice = voice
         self.sample_rate_out = sample_rate_out
         self.tts_sample_rate = 24000  # Qwen3-TTS fixed output 24kHz
         self.timeout_s = timeout_s
+        self.api_key = api_key
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -92,10 +94,14 @@ class TTSPipeline:
         wav_header_skipped = False
         leftover = b""
         session = await self._get_session()
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
             async with session.post(
                 f"{self.base_url}/audio/speech",
                 json=payload,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.timeout_s),
             ) as resp:
                 if resp.status != 200:

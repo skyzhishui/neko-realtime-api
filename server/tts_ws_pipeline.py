@@ -32,12 +32,14 @@ class TTSWebSocketPipeline:
         sample_rate: int = 24000,
         language: str = "Chinese",
         timeout_s: int = 15,
+        api_key: str | None = None,
     ):
         self.ws_url = ws_url
         self.voice = voice
         self.sample_rate = sample_rate
         self.language = language
         self.timeout_s = timeout_s
+        self.api_key = api_key
 
         self._ws = None
         self._connected = False
@@ -56,12 +58,16 @@ class TTSWebSocketPipeline:
         connection setup with LLM processing.
         """
         try:
+            extra_headers = {}
+            if self.api_key:
+                extra_headers["Authorization"] = f"Bearer {self.api_key}"
             self._ws = await asyncio.wait_for(
                 websockets.connect(
                     self.ws_url,
                     max_size=None,  # Allow large binary frames
                     ping_interval=20,
                     ping_timeout=10,
+                    additional_headers=extra_headers if extra_headers else None,
                 ),
                 timeout=self.timeout_s,
             )
