@@ -97,7 +97,7 @@ services:
   omni:
     # Omni API 基础地址（兼容 OpenAI Chat Completions 接口）
     # 需包含 /v1 前缀，如 http://localhost:8000/v1
-    base_url: http://localhost:8000/v1/v1
+    base_url: http://localhost:8000/v1
 
     # 模型名称，需与后端实际部署的模型一致
     model: Qwen3.6-35B-A3B
