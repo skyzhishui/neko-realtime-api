@@ -1,4 +1,4 @@
-"""Local ASR Engine - SenseVoiceSmall inference on local GPU.
+"""Local ASR Engine - SenseVoiceSmall inference via FunASR.
 
 Provides a singleton LocalASREngine that loads the SenseVoiceSmall model once
 at startup and shares it across all sessions. Inference is serialized via
@@ -14,7 +14,6 @@ import numpy as np
 
 logger = logging.getLogger("realtime-server")
 
-# Target sample rate for SenseVoiceSmall
 _TARGET_SAMPLE_RATE = 16000
 
 
@@ -48,38 +47,61 @@ class LocalASREngine:
                 modelscope to that path first.
             device: Device for model inference, "cuda" or "cpu". Default "cuda".
         """
-        import torch
         from funasr import AutoModel
 
-        # Determine the model identifier for AutoModel
+        _MODELSCOPE_ID = "iic/SenseVoiceSmall"
+
         if model_path is None:
-            model_id = "iic/SenseVoiceSmall"
-            logger.info("[LocalASR] No model_path specified, using modelscope default: iic/SenseVoiceSmall")
+            model_id = _MODELSCOPE_ID
+            logger.info("[LocalASR] No model_path specified, using modelscope default")
         else:
-            # Check if the path exists and contains model files
-            expanded_path = os.path.expanduser(model_path)
-            if os.path.isdir(expanded_path) and os.listdir(expanded_path):
+            # FunASR's download_model() uses os.path.exists/os.path.join internally
+            # to parse configuration.json and resolve model file paths.
+            # Relative paths break this on Windows, so always resolve to absolute.
+            expanded_path = os.path.abspath(os.path.expanduser(model_path))
+
+            # Check if the path already contains model files (config.yaml or configuration.json)
+            has_model_files = (
+                os.path.isfile(os.path.join(expanded_path, "configuration.json"))
+                or os.path.isfile(os.path.join(expanded_path, "config.yaml"))
+            )
+
+            if has_model_files:
                 model_id = expanded_path
                 logger.info(f"[LocalASR] Using local model path: {expanded_path}")
+            elif os.path.isdir(expanded_path) and os.listdir(expanded_path):
+                # Directory exists but lacks model files — likely a cache root created by
+                # snapshot_download(cache_dir=...), which stores files under
+                # cache_dir/<model_id>/ (e.g. ./models/SenseVoiceSmall/iic/SenseVoiceSmall/).
+                # Try to locate the actual model directory inside it.
+                snapshot_subdir = os.path.join(expanded_path, _MODELSCOPE_ID.replace("/", os.sep))
+                if os.path.isfile(os.path.join(snapshot_subdir, "configuration.json")) or \
+                   os.path.isfile(os.path.join(snapshot_subdir, "config.yaml")):
+                    model_id = snapshot_subdir
+                    logger.info(f"[LocalASR] Found model in snapshot subdirectory: {snapshot_subdir}")
+                else:
+                    # Fall back to downloading — let FunASR handle it via modelscope ID
+                    model_id = _MODELSCOPE_ID
+                    logger.info(f"[LocalASR] Model files not found in {expanded_path}, falling back to modelscope download")
             else:
-                # Download from modelscope
+                # Directory doesn't exist or is empty — download via modelscope
                 logger.info(f"[LocalASR] Model path {expanded_path} is empty or does not exist, downloading from modelscope...")
                 try:
                     from modelscope import snapshot_download
-                    snapshot_download("iic/SenseVoiceSmall", cache_dir=expanded_path)
-                    model_id = expanded_path
-                    logger.info(f"[LocalASR] Model downloaded to: {expanded_path}")
+                    snapshot_download(_MODELSCOPE_ID, cache_dir=expanded_path)
+                    # snapshot_download stores under cache_dir/<model_id>/
+                    snapshot_subdir = os.path.join(expanded_path, _MODELSCOPE_ID.replace("/", os.sep))
+                    model_id = snapshot_subdir if os.path.isdir(snapshot_subdir) else expanded_path
+                    logger.info(f"[LocalASR] Model downloaded to: {model_id}")
                 except Exception as e:
                     logger.error(f"[LocalASR] Failed to download model: {e}")
                     raise
 
-        # Load model onto specified device
         logger.info(f"[LocalASR] Loading model from: {model_id}, device: {device}")
         self._model = AutoModel(
             model=model_id,
             device=device,
             disable_update=True,
-            torch_dtype="float16" if device == "cuda" else "float32",
         )
         logger.info("[LocalASR] Model loaded successfully")
 
