@@ -25,7 +25,7 @@ _DEFAULT_CONFIG = {
         "smart_turn_enabled": True,
         "smart_turn_threshold": 0.5,
         "silero_model_path": "./models/silero-vad",
-        "smart_turn_path": "./models/smart-turn-v3",
+        "smart_turn_path":  "./models/smart-turn-v3",
     },
     "services": {
         "omni": {
@@ -99,7 +99,7 @@ class ServerConfig:
     def __init__(self, config_path: str | None = None):
         self._data = _DEFAULT_CONFIG.copy()
         if config_path and os.path.exists(config_path):
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 file_config = yaml.safe_load(f) or {}
             self._data = _deep_merge(self._data, file_config)
 
