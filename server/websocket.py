@@ -32,11 +32,12 @@ async def lifespan(app: FastAPI):
     if config.get("services", "asr", "local_asr", default=False):
         from .local_asr import LocalASREngine
         asr_model_path = config.get("services", "asr", "asr_model_path", default=None)
-        logger.info("[Startup] local_asr=true, pre-loading LocalASREngine...")
+        asr_device = config.get("services", "asr", "device", default="cuda")
+        logger.info(f"[Startup] local_asr=true, pre-loading LocalASREngine (device={asr_device})...")
         # LocalASREngine.__init__ is synchronous and may take several seconds
         # (model loading + warm-up), so run it in a thread to avoid blocking
         # the event loop during startup.
-        await loop.run_in_executor(None, LocalASREngine, asr_model_path)
+        await loop.run_in_executor(None, LocalASREngine, asr_model_path, asr_device)
         logger.info("[Startup] LocalASREngine pre-loaded and warmed up \u2713")
     else:
         logger.info("[Startup] local_asr=false, skipping ASR pre-load")

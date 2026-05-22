@@ -145,9 +145,14 @@ services:
     use_ws: false
 
     # 是否使用本地 ASR 引擎（GPU 推理，SenseVoiceSmall via FunASR）
-    # - true:  本地 GPU 推理，需安装 FunASR + CUDA，启动时预加载模型
+    # - true:  本地推理，需安装 FunASR，启动时预加载模型
     # - false: 使用远程 ASR 服务（通过 base_url 调用）
     local_asr: true
+
+    # 本地 ASR 推理设备
+    # - cuda:  使用 GPU 推理（需要 CUDA 环境）
+    # - cpu:   使用 CPU 推理（无需 GPU，速度较慢但兼容性更好）
+    device: cuda
 
     # 本地 ASR 模型路径（仅 local_asr=true 时生效）
     # 设为 null 则使用 modelscope 默认缓存（iic/SenseVoiceSmall）

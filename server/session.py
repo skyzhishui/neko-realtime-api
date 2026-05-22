@@ -159,14 +159,15 @@ class RealtimeSession:
         self.local_asr: LocalASREngine | None = None
         if config.get("services", "asr", "local_asr", default=False):
             asr_model_path = config.get("services", "asr", "asr_model_path", default=None)
+            asr_device = config.get("services", "asr", "device", default="cuda")
             # Use existing singleton if available, otherwise create new one
             existing = LocalASREngine.get_instance()
             if existing is not None:
                 self.local_asr = existing
                 logger.info("[Session] Using existing LocalASREngine singleton")
             else:
-                logger.info(f"[Session] Initializing LocalASREngine with model_path={asr_model_path}")
-                self.local_asr = LocalASREngine(model_path=asr_model_path)
+                logger.info(f"[Session] Initializing LocalASREngine with model_path={asr_model_path}, device={asr_device}")
+                self.local_asr = LocalASREngine(model_path=asr_model_path, device=asr_device)
         
         self.tts_pipeline = TTSPipeline(
             base_url=config.get("services", "tts", "base_url", default="http://localhost:8091/v1"),

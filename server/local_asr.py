@@ -38,7 +38,7 @@ class LocalASREngine:
 
     _instance: Optional["LocalASREngine"] = None
 
-    def __init__(self, model_path: str | None = None):
+    def __init__(self, model_path: str | None = None, device: str = "cuda"):
         """Initialize and load the SenseVoiceSmall model.
 
         Args:
@@ -46,6 +46,7 @@ class LocalASREngine:
                 modelscope default cache ("iic/SenseVoiceSmall"). If a path
                 is given but doesn't contain model files, downloads from
                 modelscope to that path first.
+            device: Device for model inference, "cuda" or "cpu". Default "cuda".
         """
         import torch
         from funasr import AutoModel
@@ -72,13 +73,13 @@ class LocalASREngine:
                     logger.error(f"[LocalASR] Failed to download model: {e}")
                     raise
 
-        # Load model onto GPU
-        logger.info(f"[LocalASR] Loading model from: {model_id}")
+        # Load model onto specified device
+        logger.info(f"[LocalASR] Loading model from: {model_id}, device: {device}")
         self._model = AutoModel(
             model=model_id,
-            device="cuda",
+            device=device,
             disable_update=True,
-            torch_dtype="float16",
+            torch_dtype="float16" if device == "cuda" else "float32",
         )
         logger.info("[LocalASR] Model loaded successfully")
 

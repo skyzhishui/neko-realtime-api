@@ -44,6 +44,7 @@ _DEFAULT_CONFIG = {
             "timeout_s": 10,
             "use_ws": False,
             "local_asr": False,
+            "device": "cuda",
             "asr_model_path": None,
         },
         "tts": {
