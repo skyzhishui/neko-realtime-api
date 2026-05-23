@@ -69,33 +69,27 @@ class LocalASREngine:
             if has_model_files:
                 model_id = expanded_path
                 logger.info(f"[LocalASR] Using local model path: {expanded_path}")
-            elif os.path.isdir(expanded_path) and os.listdir(expanded_path):
-                # Directory exists but lacks model files — likely a cache root created by
-                # snapshot_download(cache_dir=...), which stores files under
-                # cache_dir/<model_id>/ (e.g. ./models/SenseVoiceSmall/iic/SenseVoiceSmall/).
-                # Try to locate the actual model directory inside it.
+            else:
+                # Directory doesn't exist, is empty, or lacks model files —
+                # check for snapshot subdirectory first, then download if needed.
                 snapshot_subdir = os.path.join(expanded_path, _MODELSCOPE_ID.replace("/", os.sep))
                 if os.path.isfile(os.path.join(snapshot_subdir, "configuration.json")) or \
                    os.path.isfile(os.path.join(snapshot_subdir, "config.yaml")):
                     model_id = snapshot_subdir
                     logger.info(f"[LocalASR] Found model in snapshot subdirectory: {snapshot_subdir}")
                 else:
-                    # Fall back to downloading — let FunASR handle it via modelscope ID
-                    model_id = _MODELSCOPE_ID
-                    logger.info(f"[LocalASR] Model files not found in {expanded_path}, falling back to modelscope download")
-            else:
-                # Directory doesn't exist or is empty — download via modelscope
-                logger.info(f"[LocalASR] Model path {expanded_path} is empty or does not exist, downloading from modelscope...")
-                try:
-                    from modelscope import snapshot_download
-                    snapshot_download(_MODELSCOPE_ID, cache_dir=expanded_path)
-                    # snapshot_download stores under cache_dir/<model_id>/
-                    snapshot_subdir = os.path.join(expanded_path, _MODELSCOPE_ID.replace("/", os.sep))
-                    model_id = snapshot_subdir if os.path.isdir(snapshot_subdir) else expanded_path
-                    logger.info(f"[LocalASR] Model downloaded to: {model_id}")
-                except Exception as e:
-                    logger.error(f"[LocalASR] Failed to download model: {e}")
-                    raise
+                    # No model files found — download via modelscope
+                    logger.info(f"[LocalASR] Model files not found in {expanded_path}, downloading from modelscope...")
+                    try:
+                        from modelscope import snapshot_download
+                        snapshot_download(_MODELSCOPE_ID, cache_dir=expanded_path)
+                        # snapshot_download stores under cache_dir/<model_id>/
+                        snapshot_subdir = os.path.join(expanded_path, _MODELSCOPE_ID.replace("/", os.sep))
+                        model_id = snapshot_subdir if os.path.isdir(snapshot_subdir) else expanded_path
+                        logger.info(f"[LocalASR] Model downloaded to: {model_id}")
+                    except Exception as e:
+                        logger.error(f"[LocalASR] Failed to download model: {e}")
+                        raise
 
         logger.info(f"[LocalASR] Loading model from: {model_id}, device: {device}")
         self._model = AutoModel(

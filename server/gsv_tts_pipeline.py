@@ -7,7 +7,7 @@ Core flow:
 1. LLM outputs text delta -> SentenceSplitter detects complete sentences
 2. For each sentence, POST to /tts/stream (SSE)
 3. Parse SSE events: extract base64 audio from "audio" events
-4. Decode base64 -> raw int16 PCM 32kHz -> resample to 24kHz -> yield PCM bytes
+4. Decode base64 -> raw float32 PCM 32kHz -> resample to 24kHz -> yield int16 PCM bytes
 
 Output audio format: PCM16 24kHz mono (resampled from GSV's native 32kHz)
 """
@@ -35,7 +35,7 @@ class GsvTtsPipeline:
     Key differences from Qwen3-TTS TTSPipeline:
     - GSV uses SSE (Server-Sent Events) instead of raw HTTP streaming
     - Audio is base64-encoded in SSE "audio" events (not raw WAV stream)
-    - GSV outputs 32kHz int16 PCM (needs resample to 24kHz for pipeline)
+    - GSV outputs 32kHz float32 PCM [-1.0,1.0] (needs resample to 24kHz + int16 conversion for pipeline)
     - GSV requires speaker_audio, prompt_audio, prompt_text (voice cloning)
     """
 
@@ -68,24 +68,34 @@ class GsvTtsPipeline:
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
-    def _resample_32k_to_24k(self, pcm_int16: bytes) -> bytes:
-        """Resample 32kHz int16 PCM to 24kHz int16 PCM using linear interpolation."""
-        if not pcm_int16:
+    def _resample_32k_to_24k(self, float32_bytes: bytes) -> bytes:
+        """Resample 32kHz float32 PCM [-1.0,1.0] to 24kHz int16 PCM using linear interpolation.
+
+        GSV-TTS-Lite server sends audio_data as float32 bytes (np.float32 .tobytes()),
+        values in [-1.0, 1.0]. We decode as float32, resample to 24kHz, then convert
+        to int16 PCM for downstream pipeline compatibility.
+        """
+        if not float32_bytes:
             return b""
 
-        samples = np.frombuffer(pcm_int16, dtype=np.int16).astype(np.float32)
+        # Decode float32 bytes -> numpy array (GSV native format)
+        samples = np.frombuffer(float32_bytes, dtype=np.float32)
+
+        # Resample 32kHz -> 24kHz via linear interpolation
         new_len = int(len(samples) * self.sample_rate_out / self.gsv_sample_rate)
         if new_len <= 0:
             return b""
 
-        # Linear interpolation
         indices = np.linspace(0, len(samples) - 1, new_len)
         floor_idx = np.floor(indices).astype(int)
         ceil_idx = np.minimum(floor_idx + 1, len(samples) - 1)
         frac = indices - floor_idx
 
         resampled = samples[floor_idx] * (1 - frac) + samples[ceil_idx] * frac
-        resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+
+        # float32 [-1.0, 1.0] -> int16 [-32768, 32767]
+        resampled = np.clip(resampled, -1.0, 1.0)
+        resampled = (resampled * 32767).astype(np.int16)
         return resampled.tobytes()
 
     async def stream_tts(
@@ -146,7 +156,7 @@ class GsvTtsPipeline:
                                         if not audio_b64:
                                             continue
 
-                                        # Decode base64 -> raw int16 PCM 32kHz
+                                        # Decode base64 -> raw float32 PCM 32kHz (GSV native format)
                                         pcm_32k = base64.b64decode(audio_b64)
 
                                         # Resample 32kHz -> 24kHz
