@@ -155,7 +155,7 @@ asyncio.run(main())
 |------|------|----------|
 | Omni 多模态模型 | LLM 推理（A/B 模式通用） | `http://localhost:8000/v1` |
 | TTS 服务 | 语音合成（Qwen3-TTS） | `http://localhost:8091/v1` |
-| GSV-TTS-Lite | 语音克隆 TTS（可选） | `http://localhost:8001` |
+| GSV-TTS-Lite | 流式推理 TTS（可选，仅 /tts/stream） | `http://localhost:8001` |
 | 远程 ASR | 语音识别（local_asr=false 时） | `http://localhost:8082/v1` |
 
 Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。`base_url` 配置项需包含 `/v1` 路径前缀（如 `http://localhost:8000/v1`）。当后端服务需要认证时，可在 `config.yaml` 中设置 `services.omni.api_key` 和 `services.tts.api_key`，服务会自动在请求头中添加 `Authorization: Bearer <api_key>`。设为 `null` 则不发送认证头，适用于内网无认证部署。
