@@ -28,9 +28,6 @@ pyyaml>=6.0
 # Use onnxruntime-gpu for CUDA, onnxruntime for CPU, or onnxruntime-rocm for AMD ROCm
 onnxruntime>=1.18.0
 
-# Transformers - WhisperFeatureExtractor for Smart Turn
-transformers>=4.40.0
-
 # ============================================
 # Model download & management
 # ============================================

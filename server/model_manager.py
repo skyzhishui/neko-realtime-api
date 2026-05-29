@@ -6,7 +6,6 @@ feature extractors) so they are loaded once at startup and shared across session
 Thread safety:
 - ONNX InferenceSession: thread-safe for read-only inference, can be shared
 - ONNX VAD session: thread-safe for read-only inference, can be shared
-- WhisperFeatureExtractor: stateless, can be shared
 - SmartTurnDetector ONNX session: thread-safe for read-only inference, can be shared
 """
 import logging
@@ -41,7 +40,6 @@ class ModelManager:
 
         # Smart Turn model artifacts
         self._smart_turn_onnx_session = None    # onnxruntime.InferenceSession (shared)
-        self._smart_turn_feature_extractor = None  # WhisperFeatureExtractor (shared, stateless)
         self._smart_turn_provider = None
         self._smart_turn_model_path = None
 
@@ -177,17 +175,8 @@ class ModelManager:
         )
 
     def _load_smart_turn_model(self, model_dir: str):
-        """Load Smart Turn ONNX model + WhisperFeatureExtractor."""
+        """Load Smart Turn ONNX model."""
         import os
-
-        # Load feature extractor
-        try:
-            from transformers import WhisperFeatureExtractor
-            self._smart_turn_feature_extractor = WhisperFeatureExtractor(chunk_length=8)
-            logger.info("[ModelManager] Smart Turn WhisperFeatureExtractor loaded (chunk_length=8)")
-        except Exception as e:
-            logger.error(f"[ModelManager] Smart Turn WhisperFeatureExtractor load failed: {e}")
-            return
 
         # Load ONNX model
         onnx_path = os.path.join(model_dir, "smart-turn-v3.2-gpu.onnx")
@@ -284,7 +273,6 @@ class ModelManager:
             vad_backend=self._vad_backend,
             silero_model_dir=self._silero_model_dir,
             smart_turn_onnx_session=self._smart_turn_onnx_session,
-            smart_turn_feature_extractor=self._smart_turn_feature_extractor,
             smart_turn_provider=self._smart_turn_provider,
             smart_turn_model_path=self._smart_turn_model_path,
             smart_turn_threshold=self._smart_turn_threshold,
