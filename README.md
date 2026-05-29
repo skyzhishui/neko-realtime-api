@@ -140,9 +140,9 @@ Authorization: Bearer <auth_token>
 | `input_audio_buffer.speech_stopped` | 检测到用户说完 |
 | `conversation.item.input_audio_transcription.completed` | ASR 转写结果 |
 | `response.created` | 响应开始 |
-| `response.audio_transcript.delta` | LLM 文本增量 |
-| `response.audio.delta` | TTS 音频增量（base64 编码 PCM16） |
-| `response.audio_transcript.done` | 文本输出完成 |
+| `response.output_audio_transcript.delta` | LLM 文本增量 |
+| `response.output_audio.delta` | TTS 音频增量（base64 编码 PCM16） |
+| `response.output_audio_transcript.done` | 文本输出完成 |
 | `response.done` | 响应结束 |
 | `error` | 错误信息 |
 
