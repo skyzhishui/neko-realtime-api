@@ -86,6 +86,7 @@ python main.py
 | 逆文本正则化 | 启用 (ITN)，数字/日期等转为自然语言 |
 | 典型 RTF | 0.006~0.018 (CPU, Q8) |
 
+> **注意**：当前 sherpa-onnx pip 包为 CPU-only 构建。如需 GPU 加速，需从源码编译并启用 `-DSHERPA_ONNX_ENABLE_GPU=ON`。
 
 ## VAD 引擎
 
@@ -139,9 +140,9 @@ Authorization: Bearer <auth_token>
 | `input_audio_buffer.speech_stopped` | 检测到用户说完 |
 | `conversation.item.input_audio_transcription.completed` | ASR 转写结果 |
 | `response.created` | 响应开始 |
-| `response.output_audio_transcript.delta` | LLM 文本增量 |
-| `response.output_audio.delta` | TTS 音频增量（base64 编码 PCM16） |
-| `response.output_audio_transcript.done` | 文本输出完成 |
+| `response.audio_transcript.delta` | LLM 文本增量 |
+| `response.audio.delta` | TTS 音频增量（base64 编码 PCM16） |
+| `response.audio_transcript.done` | 文本输出完成 |
 | `response.done` | 响应结束 |
 | `error` | 错误信息 |
 
@@ -192,38 +193,7 @@ asyncio.run(main())
 | GSV-TTS-Lite | 流式推理 TTS（可选，仅 /tts/stream） | `http://localhost:8001` |
 | 远程 ASR | 语音识别（local_asr=false 时） | `http://localhost:8082/v1` |
 
-Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。
-
-## 更新记录
-
-### 2026-05-29
-
-- **ASR 引擎迁移**：FunASR → sherpa-onnx，本地 ASR 推理从 PyTorch 迁移至 ONNX Runtime
-  - 模型源从 `iic/SenseVoiceSmall` 更换为 `xiaowangge/sherpa-onnx-sense-voice-small`
-  - 优先使用 Q8 量化模型（228MB），RTF 从 0.009~0.049（FunASR GPU）优化至 0.006~0.018（sherpa-onnx CPU Q8）
-- **依赖优化**：`requirements.txt` 移除 pytorch/funasr/transformers等难搞的依赖，降低部署难度
-
-### 2026-05-23
-
-- 修正 GSV-TTS-Lite SSE 音频解析，简化 ASR 模型路径解析
-
-### 2026-05-22
-
-- 新增本地 ASR `device` 配置项（cuda/cpu）
-- 修复 FunASR/ModelScope 本地 ASR 模型路径解析兼容性
-
-### 2026-05-21
-
-- 新增 Omni 和 TTS 服务的 `api_key` 配置，支持 OpenAI 兼容接口认证
-
-### 2026-05-16
-
-- 优化端到端延迟
-- 修复打断时残留图片数据未清理
-
-### 2026-05-12
-
-- 初始版本发布，支持 A/B 双模式实时语音对话
+Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。`base_url` 配置项需包含 `/v1` 路径前缀（如 `http://localhost:8000/v1`）。当后端服务需要认证时，可在 `config.yaml` 中设置 `services.omni.api_key` 和 `services.tts.api_key`，服务会自动在请求头中添加 `Authorization: Bearer <api_key>`。设为 `null` 则不发送认证头，适用于内网无认证部署。
 
 ## License
 

@@ -31,8 +31,6 @@ import logging
 import time
 import os
 
-from ._whisper_features import compute_whisper_log_mel_features
-
 logger = logging.getLogger("realtime-server")
 
 
@@ -126,11 +124,12 @@ class SmartTurnDetector:
     
     技术规格：
     - 基座: Whisper Tiny (~8M参数) + 线性分类器
-    - 输入: 16kHz mono PCM float32, 最多8秒（不足后补零，超长截取末尾8秒）
+    - 输入: 16kHz mono PCM float32, 最多8秒（不足前补零，超长截取末尾8秒）
     - 输出: logits → sigmoid概率, >0.5 = Complete, <=0.5 = Incomplete
     - ONNX输入名: "input_features", 形状 (1, 80, 800) — Whisper mel spectrogram (chunk_length=8)
-    - 特征提取器: vendored numpy Whisper log-mel feature extraction
-    - 注意: 输入 8 秒音频产生 (1,80,800) 特征，匹配模型输入
+    - 特征提取器: WhisperFeatureExtractor(chunk_length=8)
+    - 注意: chunk_length=8 产生 (1,80,800), chunk_length=30 产生 (1,80,3000)
+      模型实际需要 (1,80,800)，不要混淆！
     """
     
     # ONNX Provider 优先级
@@ -163,6 +162,7 @@ class SmartTurnDetector:
         """
         self.threshold = threshold
         self._session = None
+        self._feature_extractor = None
         self._provider = None
         self._model_path = None
         
@@ -179,6 +179,9 @@ class SmartTurnDetector:
             required_files=self._REQUIRED_FILES,
         )
         
+        # 加载特征提取器
+        self._load_feature_extractor()
+        
         # 加载 ONNX 模型
         self._load_model(model_dir)
         
@@ -191,6 +194,7 @@ class SmartTurnDetector:
     def from_preloaded(
         cls,
         onnx_session,
+        feature_extractor,
         provider: str | None = None,
         model_path: str | None = None,
         threshold: float = 0.5,
@@ -198,11 +202,12 @@ class SmartTurnDetector:
         """Create a SmartTurnDetector from pre-loaded model artifacts.
 
         This skips model download and loading, using shared artifacts from ModelManager.
-        The ONNX session is shared (thread-safe for inference),
+        The ONNX session and feature extractor are shared (thread-safe for inference),
         only the threshold is per-instance.
 
         Args:
             onnx_session: Pre-loaded onnxruntime.InferenceSession (shared, read-only)
+            feature_extractor: Pre-loaded WhisperFeatureExtractor (shared, stateless)
             provider: ONNX provider name (e.g. "CUDAExecutionProvider")
             model_path: Model file path (for logging)
             threshold: Prediction threshold
@@ -213,14 +218,28 @@ class SmartTurnDetector:
         instance = cls.__new__(cls)
         instance.threshold = threshold
         instance._session = onnx_session
+        instance._feature_extractor = feature_extractor
         instance._provider = provider
         instance._model_path = model_path
         
         logger.info(
             f"[SmartTurn] initialized from preloaded: model={model_path}, "
-            f"provider={provider}, threshold={threshold}"
+            f"provider={provider}, threshold={threshold} (shared artifacts)"
         )
         return instance
+    
+    def _load_feature_extractor(self):
+        """加载 WhisperFeatureExtractor。"""
+        try:
+            from transformers import WhisperFeatureExtractor
+            # chunk_length=8 → 产生 (1, 80, 800) 特征，匹配模型输入
+            self._feature_extractor = WhisperFeatureExtractor(chunk_length=8)
+            logger.info("[SmartTurn] WhisperFeatureExtractor loaded (chunk_length=8)")
+        except Exception as e:
+            raise RuntimeError(
+                f"[SmartTurn] WhisperFeatureExtractor 加载失败: {e}. "
+                f"请安装 transformers: pip install transformers"
+            )
     
     def _load_model(self, model_dir: str):
         """加载 Smart Turn ONNX 模型。
@@ -328,7 +347,7 @@ class SmartTurnDetector:
         """
         t_start = time.perf_counter()
         
-        # 1. 音频预处理: 截取末尾8秒 + 后补零
+        # 1. 音频预处理: 截取末尾8秒 + 前补零
         processed = self._preprocess_audio(audio_float32)
         
         # 2. 特征提取: Whisper mel spectrogram → shape (1, 80, 800)
@@ -366,7 +385,7 @@ class SmartTurnDetector:
         }
     
     def _preprocess_audio(self, audio: np.ndarray) -> np.ndarray:
-        """音频预处理: 截取末尾8秒 + 不足8秒后补零。
+        """音频预处理: 截取末尾8秒 + 不足8秒前补零。
         
         Args:
             audio: float32 numpy array, 16kHz mono
@@ -379,19 +398,17 @@ class SmartTurnDetector:
             audio = audio[-self.MAX_SAMPLES:]
         
         if len(audio) < self.MAX_SAMPLES:
-            # 不足: 后补零（与 vendored feature extractor 行为一致）
+            # 不足: 前补零
             pad_len = self.MAX_SAMPLES - len(audio)
             audio = np.concatenate([
-                audio,
                 np.zeros(pad_len, dtype=np.float32),
+                audio
             ])
-
+        
         return audio
     
     def _extract_features(self, audio: np.ndarray) -> np.ndarray:
         """提取 Whisper mel spectrogram 特征。
-        
-        使用 vendored numpy 实现，无需 transformers 依赖。
         
         Args:
             audio: float32 numpy array, 长度 MAX_SAMPLES (128000)
@@ -399,9 +416,42 @@ class SmartTurnDetector:
         Returns:
             float32 numpy array, shape (1, 80, 800)
         """
-        features = compute_whisper_log_mel_features(audio, do_normalize=True)
-        # features shape: (80, 800) → add batch dimension → (1, 80, 800)
-        return features[np.newaxis, ...].astype(np.float32)
+        features = self._feature_extractor(
+            audio,
+            sampling_rate=self.TARGET_SAMPLE_RATE,
+            return_tensors="np",
+        ).input_features
+        
+        # 确保形状正确: chunk_length=8 应产生 (1, 80, 800)
+        if features.shape != self.FEATURE_SHAPE:
+            # 如果特征提取器返回的形状不对，尝试调整
+            logger.warning(
+                f"[SmartTurn] 特征形状异常: 期望 {self.FEATURE_SHAPE}, "
+                f"实际 {features.shape}, 尝试调整"
+            )
+            if features.ndim == 3 and features.shape[0] == 1 and features.shape[1] == 80:
+                target_frames = self.FEATURE_SHAPE[2]
+                if features.shape[2] < target_frames:
+                    pad = np.zeros(
+                        (1, 80, target_frames - features.shape[2]),
+                        dtype=np.float32
+                    )
+                    features = np.concatenate([features, pad], axis=2)
+                elif features.shape[2] > target_frames:
+                    features = features[:, :, :target_frames]
+            elif features.ndim == 2:
+                features = features.reshape(1, 80, -1)
+                target_frames = self.FEATURE_SHAPE[2]
+                if features.shape[2] < target_frames:
+                    pad = np.zeros(
+                        (1, 80, target_frames - features.shape[2]),
+                        dtype=np.float32
+                    )
+                    features = np.concatenate([features, pad], axis=2)
+                elif features.shape[2] > target_frames:
+                    features = features[:, :, :target_frames]
+        
+        return features.astype(np.float32)
 
 
 class SileroVADModule:
@@ -556,6 +606,7 @@ class SileroVADModule:
         vad_backend: str,
         silero_model_dir: str,
         smart_turn_onnx_session=None,
+        smart_turn_feature_extractor=None,
         smart_turn_provider: str | None = None,
         smart_turn_model_path: str | None = None,
         smart_turn_threshold: float = 0.5,
@@ -576,13 +627,14 @@ class SileroVADModule:
         Thread safety:
         - ONNX session: shared (read-only inference, thread-safe)
         - ONNX session: shared (read-only inference, thread-safe)
-        - SmartTurnDetector: created from shared ONNX session
+        - SmartTurnDetector: created from shared ONNX session + feature extractor
 
         Args:
             onnx_session: Pre-loaded ONNX InferenceSession (shared)
             vad_backend: "onnx" / "none"
             silero_model_dir: Silero model directory path
             smart_turn_onnx_session: Pre-loaded Smart Turn ONNX session (shared)
+            smart_turn_feature_extractor: Pre-loaded WhisperFeatureExtractor (shared)
             smart_turn_provider: Smart Turn ONNX provider name
             smart_turn_model_path: Smart Turn model file path
             smart_turn_threshold: Smart Turn prediction threshold
@@ -655,6 +707,7 @@ class SileroVADModule:
         if smart_turn_enabled and smart_turn_onnx_session is not None:
             instance._smart_turn = SmartTurnDetector.from_preloaded(
                 onnx_session=smart_turn_onnx_session,
+                feature_extractor=smart_turn_feature_extractor,
                 provider=smart_turn_provider,
                 model_path=smart_turn_model_path,
                 threshold=smart_turn_threshold,
