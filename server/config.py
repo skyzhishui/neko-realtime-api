@@ -45,7 +45,7 @@ _DEFAULT_CONFIG = {
             "use_ws": False,
             "local_asr": False,
             "device": "cuda",
-            "asr_model_path": None,
+            "asr_model_path": "/home/skyzhishui/models/sherpa-onnx-sense-voice-small",
         },
         "tts": {
             "base_url": "http://localhost:8091",

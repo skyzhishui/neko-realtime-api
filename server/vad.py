@@ -1,8 +1,8 @@
 """Silero VAD Module for voice activity detection + Smart Turn v3.2 endpoint detection.
 
-VAD 推理优先级：ONNX → PyTorch（降级）
+VAD inference: ONNX only (no PyTorch dependency)
 - ONNX Runtime 推理延迟更低，优先使用
-- ONNX 加载/推理失败时降级到 PyTorch
+- ONNX is the only VAD inference backend, no PyTorch fallback
 - 不使用能量检测降级方案
 
 新增策略：
@@ -12,7 +12,7 @@ VAD 推理优先级：ONNX → PyTorch（降级）
 - Smart Turn v3.2: 静音超时后二次判断话轮是否结束（Complete/Incomplete）
 
 模型路径配置（统一目录方式）：
-- silero_model_path: 指向包含 silero_vad.onnx 和 silero_vad.jit 的目录
+- silero_model_path: directory containing silero_vad.onnx
   未配置时默认通过 modelscope 缓存目录获取
 - smart_turn_path: 指向包含 smart-turn-v3.2-gpu.onnx 的目录
   未配置时默认通过 modelscope 缓存目录获取
@@ -30,6 +30,8 @@ from collections import deque
 import logging
 import time
 import os
+
+from ._whisper_features import compute_whisper_log_mel_features
 
 logger = logging.getLogger("realtime-server")
 
@@ -124,12 +126,11 @@ class SmartTurnDetector:
     
     技术规格：
     - 基座: Whisper Tiny (~8M参数) + 线性分类器
-    - 输入: 16kHz mono PCM float32, 最多8秒（不足前补零，超长截取末尾8秒）
+    - 输入: 16kHz mono PCM float32, 最多8秒（不足后补零，超长截取末尾8秒）
     - 输出: logits → sigmoid概率, >0.5 = Complete, <=0.5 = Incomplete
     - ONNX输入名: "input_features", 形状 (1, 80, 800) — Whisper mel spectrogram (chunk_length=8)
-    - 特征提取器: WhisperFeatureExtractor(chunk_length=8)
-    - 注意: chunk_length=8 产生 (1,80,800), chunk_length=30 产生 (1,80,3000)
-      模型实际需要 (1,80,800)，不要混淆！
+    - 特征提取器: vendored numpy Whisper log-mel feature extraction
+    - 注意: 输入 8 秒音频产生 (1,80,800) 特征，匹配模型输入
     """
     
     # ONNX Provider 优先级
@@ -162,7 +163,6 @@ class SmartTurnDetector:
         """
         self.threshold = threshold
         self._session = None
-        self._feature_extractor = None
         self._provider = None
         self._model_path = None
         
@@ -179,9 +179,6 @@ class SmartTurnDetector:
             required_files=self._REQUIRED_FILES,
         )
         
-        # 加载特征提取器
-        self._load_feature_extractor()
-        
         # 加载 ONNX 模型
         self._load_model(model_dir)
         
@@ -194,7 +191,6 @@ class SmartTurnDetector:
     def from_preloaded(
         cls,
         onnx_session,
-        feature_extractor,
         provider: str | None = None,
         model_path: str | None = None,
         threshold: float = 0.5,
@@ -202,12 +198,11 @@ class SmartTurnDetector:
         """Create a SmartTurnDetector from pre-loaded model artifacts.
 
         This skips model download and loading, using shared artifacts from ModelManager.
-        The ONNX session and feature extractor are shared (thread-safe for inference),
+        The ONNX session is shared (thread-safe for inference),
         only the threshold is per-instance.
 
         Args:
             onnx_session: Pre-loaded onnxruntime.InferenceSession (shared, read-only)
-            feature_extractor: Pre-loaded WhisperFeatureExtractor (shared, stateless)
             provider: ONNX provider name (e.g. "CUDAExecutionProvider")
             model_path: Model file path (for logging)
             threshold: Prediction threshold
@@ -218,28 +213,14 @@ class SmartTurnDetector:
         instance = cls.__new__(cls)
         instance.threshold = threshold
         instance._session = onnx_session
-        instance._feature_extractor = feature_extractor
         instance._provider = provider
         instance._model_path = model_path
         
         logger.info(
             f"[SmartTurn] initialized from preloaded: model={model_path}, "
-            f"provider={provider}, threshold={threshold} (shared artifacts)"
+            f"provider={provider}, threshold={threshold}"
         )
         return instance
-    
-    def _load_feature_extractor(self):
-        """加载 WhisperFeatureExtractor。"""
-        try:
-            from transformers import WhisperFeatureExtractor
-            # chunk_length=8 → 产生 (1, 80, 800) 特征，匹配模型输入
-            self._feature_extractor = WhisperFeatureExtractor(chunk_length=8)
-            logger.info("[SmartTurn] WhisperFeatureExtractor loaded (chunk_length=8)")
-        except Exception as e:
-            raise RuntimeError(
-                f"[SmartTurn] WhisperFeatureExtractor 加载失败: {e}. "
-                f"请安装 transformers: pip install transformers"
-            )
     
     def _load_model(self, model_dir: str):
         """加载 Smart Turn ONNX 模型。
@@ -347,7 +328,7 @@ class SmartTurnDetector:
         """
         t_start = time.perf_counter()
         
-        # 1. 音频预处理: 截取末尾8秒 + 前补零
+        # 1. 音频预处理: 截取末尾8秒 + 后补零
         processed = self._preprocess_audio(audio_float32)
         
         # 2. 特征提取: Whisper mel spectrogram → shape (1, 80, 800)
@@ -385,7 +366,7 @@ class SmartTurnDetector:
         }
     
     def _preprocess_audio(self, audio: np.ndarray) -> np.ndarray:
-        """音频预处理: 截取末尾8秒 + 不足8秒前补零。
+        """音频预处理: 截取末尾8秒 + 不足8秒后补零。
         
         Args:
             audio: float32 numpy array, 16kHz mono
@@ -398,17 +379,19 @@ class SmartTurnDetector:
             audio = audio[-self.MAX_SAMPLES:]
         
         if len(audio) < self.MAX_SAMPLES:
-            # 不足: 前补零
+            # 不足: 后补零（与 vendored feature extractor 行为一致）
             pad_len = self.MAX_SAMPLES - len(audio)
             audio = np.concatenate([
+                audio,
                 np.zeros(pad_len, dtype=np.float32),
-                audio
             ])
-        
+
         return audio
     
     def _extract_features(self, audio: np.ndarray) -> np.ndarray:
         """提取 Whisper mel spectrogram 特征。
+        
+        使用 vendored numpy 实现，无需 transformers 依赖。
         
         Args:
             audio: float32 numpy array, 长度 MAX_SAMPLES (128000)
@@ -416,42 +399,9 @@ class SmartTurnDetector:
         Returns:
             float32 numpy array, shape (1, 80, 800)
         """
-        features = self._feature_extractor(
-            audio,
-            sampling_rate=self.TARGET_SAMPLE_RATE,
-            return_tensors="np",
-        ).input_features
-        
-        # 确保形状正确: chunk_length=8 应产生 (1, 80, 800)
-        if features.shape != self.FEATURE_SHAPE:
-            # 如果特征提取器返回的形状不对，尝试调整
-            logger.warning(
-                f"[SmartTurn] 特征形状异常: 期望 {self.FEATURE_SHAPE}, "
-                f"实际 {features.shape}, 尝试调整"
-            )
-            if features.ndim == 3 and features.shape[0] == 1 and features.shape[1] == 80:
-                target_frames = self.FEATURE_SHAPE[2]
-                if features.shape[2] < target_frames:
-                    pad = np.zeros(
-                        (1, 80, target_frames - features.shape[2]),
-                        dtype=np.float32
-                    )
-                    features = np.concatenate([features, pad], axis=2)
-                elif features.shape[2] > target_frames:
-                    features = features[:, :, :target_frames]
-            elif features.ndim == 2:
-                features = features.reshape(1, 80, -1)
-                target_frames = self.FEATURE_SHAPE[2]
-                if features.shape[2] < target_frames:
-                    pad = np.zeros(
-                        (1, 80, target_frames - features.shape[2]),
-                        dtype=np.float32
-                    )
-                    features = np.concatenate([features, pad], axis=2)
-                elif features.shape[2] > target_frames:
-                    features = features[:, :, :target_frames]
-        
-        return features.astype(np.float32)
+        features = compute_whisper_log_mel_features(audio, do_normalize=True)
+        # features shape: (80, 800) → add batch dimension → (1, 80, 800)
+        return features[np.newaxis, ...].astype(np.float32)
 
 
 class SileroVADModule:
@@ -460,11 +410,11 @@ class SileroVADModule:
     Processes PCM16 16kHz audio frames and detects speech_started/speech_stopped events.
     Buffers small incoming frames until reaching Silero's minimum chunk size (512 samples).
     
-    VAD backend priority: ONNX → PyTorch (fallback)
+    VAD backend: ONNX only (no PyTorch dependency)
     
     模型路径配置（统一目录方式）：
-    - silero_model_path: 指向包含 silero_vad.onnx 和 silero_vad.jit 的目录
-      ONNX 和 PyTorch 降级都从这个目录加载
+    - silero_model_path: directory containing silero_vad.onnx
+      ONNX loads from this directory
     - smart_turn_path: 指向包含 smart-turn-v3.2-gpu.onnx 的目录
     
     Smart Turn integration:
@@ -530,8 +480,7 @@ class SileroVADModule:
         
         # ---- VAD 后端状态 ----
         self._onnx_session = None   # ONNX InferenceSession
-        self._model = None          # PyTorch Silero VAD 模型
-        self._vad_backend = "none"  # 当前使用的后端: "onnx" / "pytorch" / "none"
+        self._vad_backend = "none"  # "onnx" / "none"
         
         # ONNX 流式推理状态
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
@@ -604,11 +553,9 @@ class SileroVADModule:
     def from_preloaded(
         cls,
         onnx_session,
-        pytorch_model,
         vad_backend: str,
         silero_model_dir: str,
         smart_turn_onnx_session=None,
-        smart_turn_feature_extractor=None,
         smart_turn_provider: str | None = None,
         smart_turn_model_path: str | None = None,
         smart_turn_threshold: float = 0.5,
@@ -628,16 +575,14 @@ class SileroVADModule:
 
         Thread safety:
         - ONNX session: shared (read-only inference, thread-safe)
-        - PyTorch model: deep-copied per session (reset_states() is NOT thread-safe)
-        - SmartTurnDetector: created from shared ONNX session + feature extractor
+        - ONNX session: shared (read-only inference, thread-safe)
+        - SmartTurnDetector: created from shared ONNX session
 
         Args:
             onnx_session: Pre-loaded ONNX InferenceSession (shared)
-            pytorch_model: Pre-loaded PyTorch model (will be deep-copied)
-            vad_backend: "onnx" / "pytorch" / "none"
+            vad_backend: "onnx" / "none"
             silero_model_dir: Silero model directory path
             smart_turn_onnx_session: Pre-loaded Smart Turn ONNX session (shared)
-            smart_turn_feature_extractor: Pre-loaded WhisperFeatureExtractor (shared)
             smart_turn_provider: Smart Turn ONNX provider name
             smart_turn_model_path: Smart Turn model file path
             smart_turn_threshold: Smart Turn prediction threshold
@@ -671,18 +616,6 @@ class SileroVADModule:
         # ---- Shared model artifacts ----
         instance._onnx_session = onnx_session
         
-        # PyTorch model: deep copy for thread safety (reset_states is NOT thread-safe)
-        if pytorch_model is not None:
-            try:
-                import copy
-                instance._model = copy.deepcopy(pytorch_model)
-                instance._model.eval()
-                instance._model.reset_states()
-            except Exception as e:
-                logger.warning(f"[VAD] PyTorch model deep copy failed: {e}, using shared reference (NOT thread-safe)")
-                instance._model = pytorch_model
-        else:
-            instance._model = None
         
         instance._vad_backend = vad_backend
         
@@ -722,7 +655,6 @@ class SileroVADModule:
         if smart_turn_enabled and smart_turn_onnx_session is not None:
             instance._smart_turn = SmartTurnDetector.from_preloaded(
                 onnx_session=smart_turn_onnx_session,
-                feature_extractor=smart_turn_feature_extractor,
                 provider=smart_turn_provider,
                 model_path=smart_turn_model_path,
                 threshold=smart_turn_threshold,
@@ -793,11 +725,9 @@ class SileroVADModule:
             )
     
     def _load_model(self):
-        """加载 VAD 模型，优先级：ONNX → PyTorch
-        
-        所有模型文件从 self._silero_model_dir 目录加载：
-        - ONNX: silero_vad.onnx
-        - PyTorch: silero_vad.jit (通过 torch.hub.load source="local")
+        """Load VAD model (ONNX only).
+
+        Loads silero_vad.onnx from self._silero_model_dir.
         """
         # 1. 尝试 ONNX
         if self._try_load_onnx():
@@ -805,17 +735,11 @@ class SileroVADModule:
             logger.info("✅ VAD backend: ONNX Runtime (优先)")
             return
         
-        # 2. 降级到 PyTorch
-        if self._try_load_pytorch():
-            self._vad_backend = "pytorch"
-            logger.info("✅ VAD backend: PyTorch (ONNX 不可用，降级)")
-            return
-        
-        # 3. 都失败
+        # ONNX load failed
         self._vad_backend = "none"
         logger.error(
-            "❌ VAD 模型加载失败！ONNX 和 PyTorch 均不可用。"
-            "请安装 onnxruntime (pip install onnxruntime) 或确认 PyTorch + silero-vad 模型可用"
+            "VAD model load failed! ONNX not available. "
+            "Please install onnxruntime and ensure silero_vad.onnx exists"
         )
     
     def _try_load_onnx(self) -> bool:
@@ -876,65 +800,8 @@ class SileroVADModule:
             
         except Exception as e:
             logger.warning(f"[VAD] ONNX 模型加载/验证失败: {e}")
-            logger.warning("[VAD] 将降级到 PyTorch 推理")
+            logger.warning("[VAD] ONNX load failed, VAD will be unavailable")
             self._onnx_session = None
-            return False
-    
-    def _try_load_pytorch(self) -> bool:
-        """尝试加载 PyTorch Silero VAD 模型
-        
-        从 self._silero_model_dir 目录下加载 silero_vad.jit (通过 torch.jit.load)
-        
-        Returns:
-            True 如果加载并验证成功
-        """
-        jit_path = os.path.join(self._silero_model_dir, "silero_vad.jit")
-        
-        if not os.path.isfile(jit_path):
-            logger.info(f"[VAD] PyTorch 模型文件不存在: {jit_path}，跳过 PyTorch 加载")
-            return False
-        
-        try:
-            import torch
-        except ImportError:
-            logger.info("[VAD] PyTorch 未安装，跳过 PyTorch 加载")
-            return False
-        
-        try:
-            logger.info(f"[VAD] 正在通过 torch.jit.load 加载 Silero VAD: {jit_path}")
-            self._model = torch.jit.load(jit_path)
-            self._model.eval()
-            
-            # 验证 PyTorch 模型推理
-            self._model.reset_states()
-            silence = torch.zeros(512, dtype=torch.float32)
-            with torch.no_grad():
-                silence_prob = self._model(silence, self.sample_rate).item()
-            
-            # 生成类语音信号验证
-            speech_signal = self._generate_speech_like_signal().flatten()
-            self._model.reset_states()
-            with torch.no_grad():
-                speech_prob = self._model(torch.from_numpy(speech_signal), self.sample_rate).item()
-            
-            self._model.reset_states()
-            
-            if speech_prob < 0.01:
-                logger.warning(
-                    f"[VAD] PyTorch VAD 验证异常: 合成语音 prob={speech_prob:.6f}"
-                )
-                self._model = None
-                return False
-            
-            logger.info(
-                f"[VAD] ✅ PyTorch 模型验证通过 "
-                f"(静音prob={silence_prob:.4f}, 语音prob={speech_prob:.4f})"
-            )
-            return True
-            
-        except Exception as e:
-            logger.warning(f"[VAD] PyTorch 模型加载失败: {e}")
-            self._model = None
             return False
     
     def _generate_speech_like_signal(self) -> np.ndarray:
@@ -992,12 +859,6 @@ class SileroVADModule:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros((1, self._context_size), dtype=np.float32)
         
-        # PyTorch 状态重置
-        if self._model is not None:
-            try:
-                self._model.reset_states()
-            except Exception:
-                pass
         
         # VAD 埋点状态重置（保留 _frame_count 以维持周期性输出的连续性）
         self._prob_window.clear()
@@ -1007,9 +868,9 @@ class SileroVADModule:
         self._last_silence_start_time = None
     
     def _detect_frame(self, chunk: np.ndarray) -> float:
-        """对单个 CHUNK_SIZE 帧进行 VAD 检测
-        
-        优先级：ONNX → PyTorch
+        """Detect VAD for a single CHUNK_SIZE frame.
+
+        ONNX only
         
         Args:
             chunk: float32 numpy array, shape (512,), 值范围 [-1, 1]
@@ -1019,8 +880,6 @@ class SileroVADModule:
         """
         if self._onnx_session is not None:
             return self._detect_onnx(chunk)
-        elif self._model is not None:
-            return self._detect_pytorch(chunk)
         else:
             logger.error("[VAD] 无可用 VAD 后端！返回 0.0")
             return 0.0
@@ -1054,27 +913,12 @@ class SileroVADModule:
             return prob
             
         except Exception as e:
-            logger.warning(f"[VAD] ONNX 推理异常，降级到 PyTorch: {e}")
+            logger.warning(f"[VAD] ONNX inference error: {e}")
             self._onnx_session = None
-            self._vad_backend = "pytorch" if self._model is not None else "none"
+            self._vad_backend = "none"
             # 重置 ONNX 状态
             self._state = np.zeros((2, 1, 128), dtype=np.float32)
             self._context = np.zeros((1, self._context_size), dtype=np.float32)
-            # 降级到 PyTorch
-            if self._model is not None:
-                return self._detect_pytorch(chunk)
-            return 0.0
-    
-    def _detect_pytorch(self, chunk: np.ndarray) -> float:
-        """PyTorch Silero VAD 检测（降级方案）"""
-        try:
-            import torch
-            audio_tensor = torch.from_numpy(chunk)
-            with torch.no_grad():
-                prob = self._model(audio_tensor, self.sample_rate).item()
-            return prob
-        except Exception as e:
-            logger.error(f"[VAD] PyTorch 推理异常: {e}")
             return 0.0
     
     def _update_prob_stats(self, speech_prob: float):

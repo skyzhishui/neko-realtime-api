@@ -269,6 +269,8 @@ class RealtimeSession:
                      f"vad_backend={self.vad.vad_backend}, "
                      f"smart_turn_enabled={self.vad.smart_turn_enabled}")
 
+        await self.protocol.send_session_updated()
+
     async def _handle_audio_append(self, event: dict):
         """Handle input_audio_buffer.append event.
         

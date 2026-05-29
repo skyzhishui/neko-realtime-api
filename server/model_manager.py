@@ -1,12 +1,11 @@
 """Global Model Manager - Preload VAD and Smart Turn models at startup.
 
-Manages the lifecycle of heavy model artifacts (ONNX sessions, PyTorch models,
+Manages the lifecycle of heavy model artifacts (ONNX sessions,
 feature extractors) so they are loaded once at startup and shared across sessions.
 
 Thread safety:
 - ONNX InferenceSession: thread-safe for read-only inference, can be shared
-- PyTorch model: reset_states() is NOT thread-safe, each session needs its own copy
-- WhisperFeatureExtractor: stateless, can be shared
+- ONNX VAD session: thread-safe for read-only inference, can be shared
 - SmartTurnDetector ONNX session: thread-safe for read-only inference, can be shared
 """
 import logging
@@ -36,13 +35,11 @@ class ModelManager:
     def __init__(self):
         # Silero VAD model artifacts
         self._onnx_session = None       # onnxruntime.InferenceSession (shared)
-        self._pytorch_model = None      # torch.jit.RecursiveScriptModule (per-session copy needed)
-        self._vad_backend = "none"      # "onnx" / "pytorch" / "none"
+        self._vad_backend = "none"      # "onnx" / "none"
         self._silero_model_dir = None
 
         # Smart Turn model artifacts
         self._smart_turn_onnx_session = None    # onnxruntime.InferenceSession (shared)
-        self._smart_turn_feature_extractor = None  # WhisperFeatureExtractor (shared, stateless)
         self._smart_turn_provider = None
         self._smart_turn_model_path = None
 
@@ -83,7 +80,7 @@ class ModelManager:
         )
         logger.info(f"[ModelManager] Silero model dir resolved: {self._silero_model_dir}")
 
-        # ---- 2. Load Silero VAD model (ONNX preferred, PyTorch fallback) ----
+        # ---- 2. Load Silero VAD model (ONNX only) ----
         self._load_silero_model()
 
         # ---- 3. Resolve Smart Turn model directory + download check ----
@@ -122,7 +119,7 @@ class ModelManager:
         ModelManager._instance = self
 
     def _load_silero_model(self):
-        """Load Silero VAD model (ONNX preferred, PyTorch fallback)."""
+        """Load Silero VAD model (ONNX only)."""
         import os
 
         # Try ONNX first
@@ -171,63 +168,15 @@ class ModelManager:
                 logger.warning(f"[ModelManager] Silero ONNX load/validation failed: {e}")
                 self._onnx_session = None
 
-        # Fallback to PyTorch
-        jit_path = os.path.join(self._silero_model_dir, "silero_vad.jit")
-        if os.path.isfile(jit_path):
-            try:
-                import torch
-                logger.info(f"[ModelManager] Loading Silero PyTorch model: {jit_path}")
-                self._pytorch_model = torch.jit.load(jit_path)
-                self._pytorch_model.eval()
-
-                # Validate
-                self._pytorch_model.reset_states()
-                silence = torch.zeros(512, dtype=torch.float32)
-                with torch.no_grad():
-                    silence_prob = self._pytorch_model(silence, 16000).item()
-
-                speech_signal = SileroVADModule._generate_speech_like_signal_static(16000).flatten()
-                self._pytorch_model.reset_states()
-                with torch.no_grad():
-                    speech_prob = self._pytorch_model(torch.from_numpy(speech_signal), 16000).item()
-
-                self._pytorch_model.reset_states()
-
-                if speech_prob < 0.01:
-                    logger.warning(
-                        f"[ModelManager] PyTorch VAD validation abnormal: speech_prob={speech_prob:.6f}"
-                    )
-                    self._pytorch_model = None
-                else:
-                    self._vad_backend = "pytorch"
-                    logger.info(
-                        f"[ModelManager] ✅ Silero PyTorch model loaded and validated "
-                        f"(silence_prob={silence_prob:.4f}, speech_prob={speech_prob:.4f})"
-                    )
-                return
-
-            except Exception as e:
-                logger.warning(f"[ModelManager] Silero PyTorch load failed: {e}")
-                self._pytorch_model = None
-
         self._vad_backend = "none"
         logger.error(
             "[ModelManager] ❌ Silero VAD model loading failed! "
-            "Neither ONNX nor PyTorch backend available."
+            "ONNX backend not available."
         )
 
     def _load_smart_turn_model(self, model_dir: str):
-        """Load Smart Turn ONNX model + WhisperFeatureExtractor."""
+        """Load Smart Turn ONNX model."""
         import os
-
-        # Load feature extractor
-        try:
-            from transformers import WhisperFeatureExtractor
-            self._smart_turn_feature_extractor = WhisperFeatureExtractor(chunk_length=8)
-            logger.info("[ModelManager] Smart Turn WhisperFeatureExtractor loaded (chunk_length=8)")
-        except Exception as e:
-            logger.error(f"[ModelManager] Smart Turn WhisperFeatureExtractor load failed: {e}")
-            return
 
         # Load ONNX model
         onnx_path = os.path.join(model_dir, "smart-turn-v3.2-gpu.onnx")
@@ -321,11 +270,9 @@ class ModelManager:
 
         return SileroVADModule.from_preloaded(
             onnx_session=self._onnx_session,
-            pytorch_model=self._pytorch_model,
             vad_backend=self._vad_backend,
             silero_model_dir=self._silero_model_dir,
             smart_turn_onnx_session=self._smart_turn_onnx_session,
-            smart_turn_feature_extractor=self._smart_turn_feature_extractor,
             smart_turn_provider=self._smart_turn_provider,
             smart_turn_model_path=self._smart_turn_model_path,
             smart_turn_threshold=self._smart_turn_threshold,

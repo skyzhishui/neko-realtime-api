@@ -72,7 +72,10 @@ async def realtime_endpoint(
     
     # Create session
     session = RealtimeSession(websocket, model, config)
-    
+
+    # Notify client that session has been created
+    await session.protocol.send_session_created()
+
     # Main event loop
     try:
         while True:

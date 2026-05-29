@@ -52,18 +52,18 @@ class ProtocolAdapter:
     async def send_audio_delta(self, pcm_bytes: bytes):
         """Send audio delta. Output is 24kHz PCM16."""
         b64 = base64.b64encode(pcm_bytes).decode()
-        await self.send({"type": "response.audio.delta", "delta": b64})
+        await self.send({"type": "response.output_audio.delta", "delta": b64})
 
     async def send_transcript_delta(self, text: str):
         """Send transcript delta."""
-        await self.send({"type": "response.audio_transcript.delta", "delta": text})
+        await self.send({"type": "response.output_audio_transcript.delta", "delta": text})
 
     async def send_text_delta(self, text: str):
         """Send text delta."""
-        await self.send({"type": "response.text.delta", "delta": text})
+        await self.send({"type": "response.output_text.delta", "delta": text})
 
     async def send_transcript_done(self):
-        await self.send({"type": "response.audio_transcript.done"})
+        await self.send({"type": "response.output_audio_transcript.done"})
 
     async def send_response_done(self, resp_id: str, usage: dict | None = None):
         await self.send({
@@ -74,3 +74,11 @@ class ProtocolAdapter:
                 "usage": usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             },
         })
+
+    async def send_session_created(self):
+        """Send session.created event to client."""
+        await self.send({"type": "session.created"})
+
+    async def send_session_updated(self):
+        """Send session.updated event to client."""
+        await self.send({"type": "session.updated"})

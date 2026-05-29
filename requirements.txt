@@ -24,20 +24,9 @@ pyyaml>=6.0
 # VAD & Smart Turn dependencies (required)
 # ============================================
 
-# Silero VAD - PyTorch backend (fallback)
-torch>=2.2.0
-torchaudio>=2.2.0
-
-# ONNX Runtime - VAD & Smart Turn inference (preferred backend)
-# Use onnxruntime-gpu for CUDA acceleration, or onnxruntime for CPU only
-onnxruntime-gpu>=1.18.0    # GPU (recommended)
-# onnxruntime>=1.18.0      # CPU fallback (uncomment if no GPU)
-
-# Silero VAD model package
-silero-vad>=5.1
-
-# Transformers - WhisperFeatureExtractor for Smart Turn
-transformers>=4.40.0
+# ONNX Runtime - VAD & Smart Turn inference (ONNX-only, no PyTorch)
+# Use onnxruntime-gpu for CUDA, onnxruntime for CPU, or onnxruntime-rocm for AMD ROCm
+onnxruntime>=1.18.0
 
 # ============================================
 # Model download & management
@@ -50,8 +39,5 @@ modelscope>=1.18.0
 # Local ASR dependencies (optional, enable if local_asr=true)
 # ============================================
 
-# FunASR - SenseVoiceSmall local inference
-funasr>=1.1.0
-
-# Librosa - audio resampling for local ASR
-librosa>=0.10.0
+# sherpa-onnx - SenseVoice-Small ONNX inference (replaces FunASR)
+sherpa-onnx>=1.10.0
