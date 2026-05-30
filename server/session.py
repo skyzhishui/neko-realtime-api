@@ -25,7 +25,7 @@ from .protocol import ProtocolAdapter
 from .vad import SileroVADModule
 from .audio_buffer import AudioBufferManager
 from .mode_router import ModeRouter
-from .omni_client import OmniAudioClient
+from .omni_client import OmniAudioClient, ChatStreamEvent, TextDeltaEvent, ToolCallDeltaEvent, ToolCallDoneEvent, FinishEvent
 from .asr_client import SenseVoiceASRClient
 from .local_asr import LocalASREngine
 from .tts_pipeline import TTSPipeline, SentenceSplitter
@@ -55,6 +55,8 @@ class SessionConfig:
         }
         self.temperature: float = 0.7
         self.repetition_penalty: float = 1.2
+        self.tools: list[dict] | None = None  # Qwen format: [{"type":"function","function":{...}}]
+        self.enable_search: bool = False
 
     def update(self, session_data: dict):
         """Update config from session.update event data."""
@@ -78,6 +80,14 @@ class SessionConfig:
             self.temperature = float(session_data["temperature"])
         if "repetition_penalty" in session_data:
             self.repetition_penalty = float(session_data["repetition_penalty"])
+        if "tools" in session_data:
+            self.tools = session_data["tools"] or None
+        if "enable_search" in session_data:
+            self.enable_search = bool(session_data["enable_search"])
+        # tools 和 enable_search 互斥（Qwen 约束）
+        if self.tools and self.enable_search:
+            logger.warning("tools and enable_search are mutually exclusive; disabling enable_search")
+            self.enable_search = False
 
 
 class RealtimeSession:
@@ -224,6 +234,11 @@ class RealtimeSession:
         # ---- VAD offload executor ----
         self._vad_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad")
 
+        # ---- Tool calling state ----
+        self._pending_tool_results: dict[str, str] = {}        # call_id -> output
+        self._tool_result_events: dict[str, asyncio.Event] = {} # call_id -> Event (signaled when result arrives)
+        self._tool_result_timeout_s = 60  # max wait for client to send tool result
+
     async def handle_event(self, event: dict):
         """Handle incoming client event."""
         event_type = event.get("type", "")
@@ -262,12 +277,12 @@ class RealtimeSession:
             self.vad.update_silence_config(td["silence_duration_ms"])
         # session.update 时同步 voice 到 tts_pipeline
         self.tts_pipeline.voice = self.session_config.voice
-
         logger.info(f"Session updated: voice={self.session_config.voice}, "
                      f"threshold={self.vad.threshold}, "
                      f"silence_ms={self.vad.silence_duration_ms}, "
                      f"vad_backend={self.vad.vad_backend}, "
-                     f"smart_turn_enabled={self.vad.smart_turn_enabled}")
+                     f"smart_turn_enabled={self.vad.smart_turn_enabled}, "
+                     f"tools={[t['function']['name'] for t in self.session_config.tools] if self.session_config.tools else None}")
 
         await self.protocol.send_session_updated()
 
@@ -455,12 +470,22 @@ class RealtimeSession:
     async def _handle_conversation_item_create(self, event: dict):
         """Handle conversation.item.create event."""
         item = event.get("item", {})
-        if item.get("type") == "message":
+        item_type = item.get("type", "")
+        if item_type == "message":
             role = item.get("role", "user")
             content = item.get("content", [])
             msg = {"role": role, "content": content}
             self.conversation.append(msg)
             logger.info(f"Added conversation item: role={role}")
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id", "")
+            output = item.get("output", "")
+            if call_id:
+                self._pending_tool_results[call_id] = output
+                # Signal waiting tool loop that result is available
+                if call_id in self._tool_result_events:
+                    self._tool_result_events[call_id].set()
+                logger.info(f"Stored tool result for call_id={call_id} ({len(output)} chars)")
 
     async def _handle_response_create(self, event: dict):
         """Handle response.create event."""
@@ -484,40 +509,179 @@ class RealtimeSession:
         self._is_responding = False
 
     # ----------------------------------------------------------------
-    # 公共流式管线方法：LLM → TTS 流式处理
+    # 公共流式管线方法：LLM → TTS 流式处理（支持 tool calling）
     # ----------------------------------------------------------------
 
+    def _llm_stream_kwargs(self) -> dict:
+        """Common kwargs for omni_client.stream_chat calls."""
+        return {
+            "temperature": self.session_config.temperature,
+            "repetition_penalty": self.session_config.repetition_penalty,
+            "max_tokens": self.config.get("services", "omni", "max_tokens", default=4096),
+            "timeout_s": self.config.get("services", "omni", "timeout_s", default=30),
+            "tools": self.session_config.tools,
+            "enable_search": self.session_config.enable_search,
+        }
+
     async def _stream_llm_to_tts(self, messages: list[dict], resp_id: str):
-        """公共 LLM→TTS 流式管线逻辑。
+        """公共 LLM→TTS 流式管线逻辑（带 tool calling 支持）。
 
-        根据 tts_mode 选择不同管线：
-        - "http": 分句 HTTP 模式（原有逻辑，SentenceSplitter → stream_tts）
-        - "ws": 逐字流式 WS 模式（LLM token 即时送 TTS，更低延迟）
-
-        Args:
-            messages: 发送给 LLM 的消息列表
-            resp_id: 当前响应 ID（用于打断处理）
+        如果 session 配置了 tools，走 _stream_llm_with_tool_loop；
+        否则走纯文本→TTS 直通路径。
 
         Returns:
             str: LLM 生成的完整文本（用于写入 conversation history）
         """
+        if self.session_config.tools:
+            return await self._stream_llm_with_tool_loop(messages, resp_id)
+
         if self.tts_mode == "ws":
             return await self._stream_llm_to_tts_ws(messages, resp_id)
         else:
             return await self._stream_llm_to_tts_http(messages, resp_id)
 
-    async def _stream_llm_to_tts_http(self, messages: list[dict], resp_id: str):
-        """HTTP 模式：分句 → 逐句 HTTP TTS（流水线并行版）。
-        
-        架构：LLM 流式产出 delta → SentenceSplitter 分句 → 每句启动后台 TTS Task
-        → TTS 产出 chunk 推入 per-sentence Queue → 独立的 drain task 按顺序消费队列
-        并即时发送音频给客户端。
-        
-        关键：drain task 是独立后台协程，不依赖 LLM delta 触发。
-        TTS first chunk 产出后立即被 drain task 消费并发送给客户端。
+    # ---- Tool calling lifecycle ----
+
+    async def _stream_llm_with_tool_loop(self, messages: list[dict], resp_id: str) -> str:
+        """LLM→TTS with tool calling support.
+
+        Loops: LLM call → if finish_reason=="tool_calls" → emit delta/done events
+        → wait for client tool results → append tool messages → re-invoke LLM
+        → until finish_reason=="stop".
+
+        Returns the final text response (from the last LLM call that produced text).
+        """
+        MAX_TOOL_ROUNDS = 5
+        full_response_text = ""
+        current_messages = list(messages)  # copy to avoid mutating original
+        output_index = 0
+        all_tool_calls: list[dict] = []  # collect across rounds for conversation history
+
+        for round_num in range(MAX_TOOL_ROUNDS):
+            # Stream LLM, routing text→TTS and tool_calls→protocol events
+            text_parts: list[str] = []
+            tool_calls_seen: dict[int, dict] = {}  # index -> {call_id, name, arguments}
+            finish_reason = "stop"
+            has_tool_calls = False
+
+            if self.tts_mode == "ws":
+                round_text, round_tc, round_fr = await self._stream_llm_events_to_tts_ws(
+                    current_messages, resp_id, output_index,
+                )
+            else:
+                round_text, round_tc, round_fr = await self._stream_llm_events_to_tts_http(
+                    current_messages, resp_id, output_index,
+                )
+
+            text_parts.append(round_text)
+            tool_calls_seen = round_tc
+            finish_reason = round_fr
+            output_index += len(tool_calls_seen)
+
+            if finish_reason != "tool_calls" or not tool_calls_seen:
+                # Normal completion
+                full_response_text = "".join(text_parts)
+                break
+
+            has_tool_calls = True
+            logger.info(f"[Tool Loop] Round {round_num}: {len(tool_calls_seen)} tool call(s), waiting for results")
+
+            # 1. Build assistant message with tool_calls for Chat Completions
+            assistant_tool_calls = []
+            for idx in sorted(tool_calls_seen.keys()):
+                tc = tool_calls_seen[idx]
+                assistant_tool_calls.append({
+                    "id": tc["call_id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                })
+                all_tool_calls.append({
+                    "id": tc["call_id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                })
+
+            round_text_str = round_text if isinstance(round_text, str) else ""
+            current_messages.append({
+                "role": "assistant",
+                "content": round_text_str or None,
+                "tool_calls": assistant_tool_calls,
+            })
+
+            # 2. Wait for all tool results from client
+            for idx in sorted(tool_calls_seen.keys()):
+                tc = tool_calls_seen[idx]
+                call_id = tc["call_id"]
+
+                if call_id in self._pending_tool_results:
+                    result = self._pending_tool_results.pop(call_id)
+                else:
+                    # Create event and wait (main event loop continues processing)
+                    evt = asyncio.Event()
+                    self._tool_result_events[call_id] = evt
+                    try:
+                        await asyncio.wait_for(evt.wait(), timeout=self._tool_result_timeout_s)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[Tool Loop] Timeout waiting for tool result call_id={call_id}")
+                        await self.protocol.send_error(f"Tool result timeout for {tc['name']}")
+                        del self._tool_result_events[call_id]
+                        full_response_text = "".join(text_parts)
+                        break
+                    except asyncio.CancelledError:
+                        # Pipeline cancelled while waiting for tool result — clean up
+                        logger.info(f"[Tool Loop] Cancelled while waiting for tool result call_id={call_id}")
+                        del self._tool_result_events[call_id]
+                        raise
+                    del self._tool_result_events[call_id]
+                    result = self._pending_tool_results.pop(call_id, "")
+
+                current_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result,
+                })
+                logger.info(f"[Tool Loop] Received result for {tc['name']} (call_id={call_id}, {len(result)} chars)")
+            else:
+                # 3. Re-invoke LLM — loop continues
+                resp_id = await self.protocol.send_response_created()
+                self._current_resp_id = resp_id
+                continue
+            # If we broke out of the inner for loop (timeout), exit outer loop too
+            break
+
+        # Update conversation history
+        if all_tool_calls:
+            self.conversation.append({
+                "role": "assistant",
+                "content": full_response_text or None,
+                "tool_calls": all_tool_calls,
+            })
+            # Tool result messages are already in current_messages but not self.conversation;
+            # add them for future turns
+            for msg in current_messages:
+                if msg.get("role") == "tool" and msg not in self.conversation:
+                    self.conversation.append(msg)
+        else:
+            if full_response_text:
+                self.conversation.append({"role": "assistant", "content": full_response_text})
+
+        return full_response_text
+
+    # ---- Event-based LLM streaming with TTS routing (HTTP mode) ----
+
+    async def _stream_llm_events_to_tts_http(
+        self, messages: list[dict], resp_id: str, output_index: int = 0,
+    ) -> tuple[str, dict[int, dict], str]:
+        """Stream LLM ChatStreamEvents → TTS for text, protocol events for tool_calls (HTTP mode).
+
+        Returns: (full_text, tool_calls_seen dict, finish_reason)
         """
         self.tts_pipeline.voice = self.session_config.voice
         full_text = ""
+        tool_calls_seen: dict[int, dict] = {}
+        finish_reason = "stop"
+        has_tool_calls = False
+
         splitter = SentenceSplitter(
             min_sub_sentence_len=self.config.get("tts_pipeline", "min_sub_sentence_len", default=6)
         )
@@ -563,34 +727,66 @@ class RealtimeSession:
         drain_task = asyncio.create_task(_drain_loop())
 
         try:
-            async for text_delta in self.omni_client.stream_chat(
-                messages=messages,
-                temperature=self.session_config.temperature,
-                repetition_penalty=self.session_config.repetition_penalty,
-                max_tokens=self.config.get("services", "omni", "max_tokens", default=4096),
-                timeout_s=self.config.get("services", "omni", "timeout_s", default=30),
+            async for event in self.omni_client.stream_chat(
+                messages=messages, **self._llm_stream_kwargs(),
             ):
-                full_text += text_delta
-                await self.protocol.send_transcript_delta(text_delta)
+                if event["type"] == "text":
+                    text_delta = event["delta"]
+                    full_text += text_delta
+                    await self.protocol.send_transcript_delta(text_delta)
+                    # Only send text to TTS if no tool calls detected yet in this round
+                    if not has_tool_calls:
+                        sentences = splitter.add_text(text_delta)
+                        for sentence in sentences:
+                            logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}')
+                            q = asyncio.Queue()
+                            sentence_audio_queues.append(q)
+                            task = asyncio.create_task(_process_sentence_tts(sentence, q))
+                            tts_tasks.append(task)
 
-                sentences = splitter.add_text(text_delta)
-                for sentence in sentences:
-                    logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}')
+                elif event["type"] == "tool_call":
+                    has_tool_calls = True
+                    idx = event["index"]
+                    call_id = event["call_id"]
+                    name = event.get("name")
+                    args_delta = event["arguments_delta"]
+
+                    if idx not in tool_calls_seen:
+                        tool_calls_seen[idx] = {"call_id": call_id, "name": name or "", "arguments": ""}
+                        logger.info(f"[Tool Call] function_call started: name={name or '?'}, call_id={call_id}, index={idx}")
+                        await self.protocol.send_function_call_item_added(
+                            call_id, name or "", resp_id, output_index + idx,
+                        )
+                    if name:
+                        tool_calls_seen[idx]["name"] = name
+                    tool_calls_seen[idx]["arguments"] += args_delta
+
+                    await self.protocol.send_function_call_arguments_delta(
+                        call_id, tool_calls_seen[idx]["name"], args_delta,
+                    )
+
+                elif event["type"] == "tool_call_done":
+                    tc = tool_calls_seen.get(event["index"], {})
+                    if tc:
+                        await self.protocol.send_function_call_arguments_done(
+                            tc["call_id"], tc["name"], tc["arguments"],
+                            resp_id, output_index + event["index"],
+                        )
+
+                elif event["type"] == "finish":
+                    finish_reason = event["finish_reason"]
+
+            # Flush remaining text to TTS (only if no tool calls)
+            if not has_tool_calls:
+                for sentence in splitter.flush():
+                    logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}(flush)')
                     q = asyncio.Queue()
                     sentence_audio_queues.append(q)
                     task = asyncio.create_task(_process_sentence_tts(sentence, q))
                     tts_tasks.append(task)
 
-            for sentence in splitter.flush():
-                logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}(flush)')
-                q = asyncio.Queue()
-                sentence_audio_queues.append(q)
-                task = asyncio.create_task(_process_sentence_tts(sentence, q))
-                tts_tasks.append(task)
-
             all_sentences_enqueued = True
             await drain_task
-
             if tts_tasks:
                 await asyncio.gather(*tts_tasks, return_exceptions=True)
 
@@ -603,54 +799,46 @@ class RealtimeSession:
                     task.cancel()
             raise
 
-        return full_text
+        return full_text, tool_calls_seen, finish_reason
 
-    async def _stream_llm_to_tts_ws(self, messages: list[dict], resp_id: str):
-        """WS 模式：逐字流式 TTS，LLM token 即时送 TTS。
-        
-        重写要点：
-        - 去掉所有 should_cancel() 检查
-        - 利用 CancelledError 传播实现即时取消
-        - 在 CancelledError handler 中关闭 TTS WS 连接
-        - receive_task 也需要取消
+    # ---- Event-based LLM streaming with TTS routing (WS mode) ----
 
-        核心流程（并行优化版）：
-        1. ASR结果送LLM时，同时建立WS连接（发送session.config）
-        2. LLM出首token后，立即开始送文本给TTS
-        3.【并行】TTS音频接收与LLM流式输出同时进行，首chunk出来马上播放
-        4. LLM输出完成后，发送input.done
-        5. 等待TTS音频全部接收完毕
+    async def _stream_llm_events_to_tts_ws(
+        self, messages: list[dict], resp_id: str, output_index: int = 0,
+    ) -> tuple[str, dict[int, dict], str]:
+        """Stream LLM ChatStreamEvents → TTS for text, protocol events for tool_calls (WS mode).
+
+        Returns: (full_text, tool_calls_seen dict, finish_reason)
         """
-        t0 = time.time()  # 基准时间：ASR结果送LLM的时刻
+        t0 = time.time()
         full_text = ""
+        tool_calls_seen: dict[int, dict] = {}
+        finish_reason = "stop"
+        has_tool_calls = False
+
         ws_pipeline = TTSWebSocketPipeline(
             ws_url=self.tts_ws_url,
-            voice=self.session_config.voice,  # C1 fix: 使用 session_config.voice
+            voice=self.session_config.voice,
             sample_rate=self.config.get("services", "tts", "sample_rate", default=24000),
             language=self.config.get("services", "tts", "language", default="Chinese"),
             timeout_s=self.config.get("services", "tts", "timeout_s", default=15),
             api_key=self.config.get("services", "tts", "api_key", default=None),
         )
 
-        # 并行音频接收任务的状态
         tts_first_chunk_received = False
         tts_receive_done = asyncio.Event()
-        tts_error: list[str | None] = [None]  # 用list包装以便在闭包中修改
+        tts_error: list[str | None] = [None]
 
         async def _receive_and_send_audio():
-            """并行任务：从TTS WS接收音频块并立即发送给客户端。"""
             nonlocal tts_first_chunk_received
             try:
                 async for pcm_chunk in ws_pipeline.receive_audio():
-                    # 埋点：TTS首chunk
                     if not tts_first_chunk_received:
                         tts_first_chunk_received = True
                         latency_ms = (time.time() - t0) * 1000
                         logger.info(f'[TRACE] tts_ws_first_chunk: latency={latency_ms:.1f}ms, chunk_size={len(pcm_chunk)}')
-
                     await self.protocol.send_audio_delta(pcm_chunk)
             except asyncio.CancelledError:
-                # 被取消时，直接退出，不继续接收音频
                 logger.info("[Session] TTS WS receive_and_send_audio cancelled")
                 raise
             except Exception as e:
@@ -661,80 +849,93 @@ class RealtimeSession:
 
         receive_task = None
         try:
-            # 1. 建连：ASR结果送LLM时就建连
             await ws_pipeline.connect()
             logger.info(f'[TRACE] tts_ws_connected: latency={(time.time() - t0) * 1000:.1f}ms')
-
-            # 2. 启动并行音频接收任务（LLM输出前就启动，确保首chunk出来立刻消费）
             receive_task = asyncio.create_task(_receive_and_send_audio())
 
-            # 3. LLM 流式输出 + 即时送 TTS（与音频接收并行）
             llm_first_token = False
             tts_first_text_sent = False
 
-            async for text_delta in self.omni_client.stream_chat(
-                messages=messages,
-                temperature=self.session_config.temperature,
-                repetition_penalty=self.session_config.repetition_penalty,
-                max_tokens=self.config.get("services", "omni", "max_tokens", default=4096),
-                timeout_s=self.config.get("services", "omni", "timeout_s", default=30),
+            async for event in self.omni_client.stream_chat(
+                messages=messages, **self._llm_stream_kwargs(),
             ):
-                full_text += text_delta
-                await self.protocol.send_transcript_delta(text_delta)
+                if event["type"] == "text":
+                    text_delta = event["delta"]
+                    full_text += text_delta
+                    await self.protocol.send_transcript_delta(text_delta)
 
-                # 埋点：LLM首token
-                if not llm_first_token:
-                    llm_first_token = True
-                    latency_ms = (time.time() - t0) * 1000
-                    logger.info(f'[TRACE] llm_first_token: latency={latency_ms:.1f}ms')
+                    if not llm_first_token:
+                        llm_first_token = True
+                        latency_ms = (time.time() - t0) * 1000
+                        logger.info(f'[TRACE] llm_first_token: latency={latency_ms:.1f}ms')
 
-                # 即时送文本给TTS WS
-                await ws_pipeline.send_text_delta(text_delta)
+                    # Only send text to TTS WS if no tool calls detected
+                    if not has_tool_calls:
+                        await ws_pipeline.send_text_delta(text_delta)
+                        if not tts_first_text_sent:
+                            tts_first_text_sent = True
+                            latency_ms = (time.time() - t0) * 1000
+                            logger.info(f'[TRACE] tts_ws_text_sent: latency={latency_ms:.1f}ms, text="{text_delta[:20]}"')
 
-                # 埋点：首次送TTS文本
-                if not tts_first_text_sent:
-                    tts_first_text_sent = True
-                    latency_ms = (time.time() - t0) * 1000
-                    logger.info(f'[TRACE] tts_ws_text_sent: latency={latency_ms:.1f}ms, text="{text_delta[:20]}"')
+                elif event["type"] == "tool_call":
+                    has_tool_calls = True
+                    idx = event["index"]
+                    call_id = event["call_id"]
+                    name = event.get("name")
+                    args_delta = event["arguments_delta"]
 
-            # 4. LLM输出完成，发送input.done
-            await ws_pipeline.finish_input()
+                    if idx not in tool_calls_seen:
+                        tool_calls_seen[idx] = {"call_id": call_id, "name": name or "", "arguments": ""}
+                        logger.info(f"[Tool Call] function_call started: name={name or '?'}, call_id={call_id}, index={idx}")
+                        await self.protocol.send_function_call_item_added(
+                            call_id, name or "", resp_id, output_index + idx,
+                        )
+                    if name:
+                        tool_calls_seen[idx]["name"] = name
+                    tool_calls_seen[idx]["arguments"] += args_delta
 
-            # 5. 等待TTS音频全部接收完毕
-            await receive_task
+                    await self.protocol.send_function_call_arguments_delta(
+                        call_id, tool_calls_seen[idx]["name"], args_delta,
+                    )
 
-            if tts_error[0]:
-                raise RuntimeError(f"TTS receive error: {tts_error[0]}")
+                elif event["type"] == "tool_call_done":
+                    tc = tool_calls_seen.get(event["index"], {})
+                    if tc:
+                        await self.protocol.send_function_call_arguments_done(
+                            tc["call_id"], tc["name"], tc["arguments"],
+                            resp_id, output_index + event["index"],
+                        )
 
-            # 埋点：TTS播放完成
-            latency_ms = (time.time() - t0) * 1000
-            logger.info(
-                f'[TRACE] tts_ws_done: latency={latency_ms:.1f}ms, '
-                f'total_sentences={ws_pipeline.total_sentences}'
-            )
+                elif event["type"] == "finish":
+                    finish_reason = event["finish_reason"]
+
+            # Finish TTS input (only if we were sending text to TTS)
+            if not has_tool_calls:
+                await ws_pipeline.finish_input()
+                await receive_task
+                if tts_error[0]:
+                    raise RuntimeError(f"TTS receive error: {tts_error[0]}")
+                latency_ms = (time.time() - t0) * 1000
+                logger.info(f'[TRACE] tts_ws_done: latency={latency_ms:.1f}ms, total_sentences={ws_pipeline.total_sentences}')
 
         except asyncio.CancelledError:
-            # Pipeline 被取消（用户打断），立即关闭所有连接
             logger.info("[Session] TTS WS pipeline cancelled by interruption")
-            # 取消接收任务
             if receive_task and not receive_task.done():
                 receive_task.cancel()
                 try:
                     await receive_task
                 except asyncio.CancelledError:
                     pass
-            # 关闭WS连接（在finally中也会关闭，这里提前关闭确保音频不再发送）
             await ws_pipeline.close()
-            raise  # 重新抛出，让 _process_speech_input 的 except CancelledError 处理
+            raise
         except Exception as e:
             logger.error(f"TTS WS pipeline error: {e}", exc_info=True)
             raise
         finally:
-            # 确保WS连接被关闭
             if ws_pipeline.is_connected:
                 await ws_pipeline.close()
 
-        return full_text
+        return full_text, tool_calls_seen, finish_reason
 
     async def _process_speech_input(self):
         """Process speech input after VAD speech_stopped.
@@ -808,7 +1009,8 @@ class RealtimeSession:
             
             full_text = await self._stream_llm_to_tts(messages, resp_id)
             
-            if full_text:
+            # Only append to conversation if tool loop isn't handling it
+            if full_text and not self.session_config.tools:
                 self.conversation.append({"role": "assistant", "content": full_text})
             
             self.mode_router.report_omni_success()
@@ -889,7 +1091,8 @@ class RealtimeSession:
             
             full_text = await self._stream_llm_to_tts(messages, resp_id)
             
-            if full_text:
+            # Only append to conversation if tool loop isn't handling it
+            if full_text and not self.session_config.tools:
                 self.conversation.append({"role": "assistant", "content": full_text})
             
         except asyncio.CancelledError:
@@ -921,7 +1124,8 @@ class RealtimeSession:
             try:
                 full_text = await self._stream_llm_to_tts(messages, resp_id)
                 
-                if full_text:
+                # Only append to conversation if tool loop isn't handling it
+                if full_text and not self.session_config.tools:
                     self.conversation.append({"role": "assistant", "content": full_text})
                 
                 await self.protocol.send_transcript_done()
@@ -948,6 +1152,25 @@ class RealtimeSession:
         for msg in self.conversation[-10:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            
+            # Tool role messages (from tool calling results)
+            if role == "tool":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", ""),
+                })
+                continue
+            
+            # Assistant messages with tool_calls
+            if role == "assistant" and msg.get("tool_calls"):
+                messages.append({
+                    "role": "assistant",
+                    "content": content if isinstance(content, str) and content else None,
+                    "tool_calls": msg["tool_calls"],
+                })
+                continue
+            
             if isinstance(content, str):
                 messages.append({"role": role, "content": content})
             elif isinstance(content, list):

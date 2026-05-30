@@ -82,3 +82,40 @@ class ProtocolAdapter:
     async def send_session_updated(self):
         """Send session.updated event to client."""
         await self.send({"type": "session.updated"})
+
+    # ── Tool calling events ─────────────────────────────────────────
+
+    async def send_function_call_item_added(self, call_id: str, name: str, resp_id: str, output_index: int):
+        """Send response.output_item.added for a function_call item."""
+        await self.send({
+            "type": "response.output_item.added",
+            "response_id": resp_id,
+            "output_index": output_index,
+            "item": {
+                "type": "function_call",
+                "id": f"fc_{call_id}",
+                "call_id": call_id,
+                "name": name,
+                "arguments": "",
+            },
+        })
+
+    async def send_function_call_arguments_delta(self, call_id: str, name: str, delta: str):
+        """Stream function call arguments incrementally."""
+        await self.send({
+            "type": "response.function_call_arguments.delta",
+            "call_id": call_id,
+            "name": name,
+            "delta": delta,
+        })
+
+    async def send_function_call_arguments_done(self, call_id: str, name: str, arguments: str, resp_id: str, output_index: int):
+        """Signal that function call arguments are complete."""
+        await self.send({
+            "type": "response.function_call_arguments.done",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "response_id": resp_id,
+            "output_index": output_index,
+        })

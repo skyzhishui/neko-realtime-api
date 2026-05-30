@@ -39,7 +39,7 @@ realtime_server:
 # ------------------------------------------------------------
 vad:
   # VAD 引擎类型
-  # - silero: 使用 Silero VAD 模型（ONNX 推理，无需 PyTorch）
+  # - silero: 使用 Silero VAD 模型
   engine: silero
 
   # 语音检测阈值（0.0~1.0），值越高要求越严格
