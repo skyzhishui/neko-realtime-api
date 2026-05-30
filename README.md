@@ -196,6 +196,10 @@ Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Spe
 
 ## 更新记录
 
+### 2026-05-30
+
+- 新增 Tool Calling（工具调用）支持，兼容 Qwen 工具调用协议
+
 ### 2026-05-29
 
 - **ASR 引擎迁移**：FunASR → sherpa-onnx，本地 ASR 推理从 PyTorch 迁移至 ONNX Runtime
