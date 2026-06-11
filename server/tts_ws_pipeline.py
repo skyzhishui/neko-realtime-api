@@ -33,6 +33,8 @@ class TTSWebSocketPipeline:
         language: str = "Chinese",
         timeout_s: int = 15,
         api_key: str | None = None,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
     ):
         self.ws_url = ws_url
         self.voice = voice
@@ -40,6 +42,10 @@ class TTSWebSocketPipeline:
         self.language = language
         self.timeout_s = timeout_s
         self.api_key = api_key
+
+        # Voice cloning (ref_audio/ref_text)
+        self.ref_audio = ref_audio
+        self.ref_text = ref_text
 
         self._ws = None
         self._connected = False
@@ -82,6 +88,11 @@ class TTSWebSocketPipeline:
                 "sample_rate": self.sample_rate,
                 "language": self.language,
             }
+            # Voice cloning parameters
+            if self.ref_audio:
+                config_msg["ref_audio"] = self.ref_audio
+                if self.ref_text:
+                    config_msg["ref_text"] = self.ref_text
             await self._ws.send(json.dumps(config_msg))
             logger.info(f'[TRACE] tts_ws_connected: voice={self.voice}, url={self.ws_url}')
 

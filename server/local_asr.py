@@ -188,8 +188,8 @@ class LocalASREngine:
         self._recognizer.decode_stream(stream)
         logger.info("[LocalASR] Model warm-up complete")
 
-        # Inference lock for thread safety
-        self._lock = asyncio.Lock()
+        # Lock will be lazily initialized in transcribe() on the main event loop
+        self._lock: asyncio.Lock | None = None
 
         # Store as singleton
         LocalASREngine._instance = self
@@ -229,6 +229,8 @@ class LocalASREngine:
                 res_type="soxr_mq",
             )
 
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         # Run inference in executor with lock (thread-safe, non-blocking)
         loop = asyncio.get_running_loop()
         async with self._lock:

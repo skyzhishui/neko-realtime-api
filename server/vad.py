@@ -521,6 +521,9 @@ class SileroVADModule:
         # ---- Smart Turn 话轮检测 ----
         self._smart_turn = None  # SmartTurnDetector 实例
         self._turn_audio_chunks = []  # list of numpy arrays, concatenated only on demand
+        self._smart_turn_max_audio_seconds = 30
+        self._consecutive_incomplete_count = 0
+        self._max_consecutive_incomplete = 3
         
         if self.smart_turn_enabled:
             self._init_smart_turn()
@@ -651,6 +654,9 @@ class SileroVADModule:
         
         # ---- Smart Turn (from preloaded artifacts) ----
         instance._turn_audio_chunks = []
+        instance._smart_turn_max_audio_seconds = 30
+        instance._consecutive_incomplete_count = 0
+        instance._max_consecutive_incomplete = 3
         
         if smart_turn_enabled and smart_turn_onnx_session is not None:
             instance._smart_turn = SmartTurnDetector.from_preloaded(
@@ -854,6 +860,7 @@ class SileroVADModule:
         
         # Smart Turn 音频缓冲重置
         self._turn_audio_chunks = []
+        self._consecutive_incomplete_count = 0
         
         # ONNX 状态重置
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
@@ -928,17 +935,18 @@ class SileroVADModule:
             speech_prob: 当前帧的语音概率
         """
         self._frame_count += 1
+        
+        # deque(maxlen=60) 自动维护窗口大小，无需手动 pop
+        # 但需要在 append 之前检查即将被丢弃的元素来更新 _speech_frame_count_in_window
+        # （append 之后 [0] 已不是被丢弃的元素，而是第二个元素）
+        if len(self._prob_window) == self._prob_window.maxlen:
+            oldest = self._prob_window[0]  # 即将被 append 自动丢弃的最老元素
+            if oldest >= self.threshold:
+                self._speech_frame_count_in_window -= 1
+        
         self._prob_window.append(speech_prob)
         if speech_prob >= self.threshold:
             self._speech_frame_count_in_window += 1
-        
-        # deque(maxlen=60) 自动维护窗口大小，无需手动 pop
-        # 但需要检查被自动丢弃的元素来更新 _speech_frame_count_in_window
-        if len(self._prob_window) == self._prob_window.maxlen:
-            # 下一个 append 会自动丢弃最老的元素
-            oldest = self._prob_window[0]
-            if oldest >= self.threshold:
-                self._speech_frame_count_in_window -= 1
         
         # 周期性输出（每 _PROB_LOG_INTERVAL_FRAMES 帧输出一次）
         if self._frame_count % self._PROB_LOG_INTERVAL_FRAMES == 0:
@@ -954,39 +962,61 @@ class SileroVADModule:
                     f"backend={self._vad_backend}"
                 )
     
+    def _trim_turn_audio_chunks(self):
+        max_samples = self._smart_turn_max_audio_seconds * self.sample_rate
+        total = sum(len(c) for c in self._turn_audio_chunks)
+        if total <= max_samples:
+            return
+        kept = []
+        remaining = max_samples
+        for chunk in reversed(self._turn_audio_chunks):
+            if remaining <= 0:
+                break
+            if len(chunk) <= remaining:
+                kept.append(chunk)
+                remaining -= len(chunk)
+            else:
+                kept.append(chunk[-remaining:])
+                remaining = 0
+        self._turn_audio_chunks = list(reversed(kept))
+
     def _check_smart_turn(self) -> bool:
-        """调用 Smart Turn 判断话轮是否结束。
-        
-        Returns:
-            True = Complete (用户说完了，应触发 speech_stopped)
-            False = Incomplete (用户还在思考，应继续等待)
-        """
         if self._smart_turn is None:
-            # Smart Turn 未启用，默认 Complete
             return True
-        
+
         if len(self._turn_audio_chunks) == 0:
-            # 没有累积音频，默认 Complete
-            logger.warning("[SmartTurn] _turn_audio_chunks 为空，默认判定 Complete")
+            logger.warning("[SmartTurn] _turn_audio_chunks empty, defaulting to Complete")
             return True
-        
+
+        self._trim_turn_audio_chunks()
+
+        if self._consecutive_incomplete_count >= self._max_consecutive_incomplete:
+            logger.info(
+                f"[SmartTurn] consecutive Incomplete limit reached "
+                f"({self._consecutive_incomplete_count}/{self._max_consecutive_incomplete}), "
+                f"forcing Complete"
+            )
+            return True
+
         turn_audio = np.concatenate(self._turn_audio_chunks)
         result = self._smart_turn.predict_endpoint(turn_audio)
-        
+
         if result["prediction"] == 1:
-            # Complete: 用户说完了
             logger.info(
-                f"[SmartTurn] ✅ Complete (prob={result['probability']:.4f}), "
-                f"触发 speech_stopped"
+                f'[SmartTurn] Complete (prob={result["probability"]:.4f}), '
+                f'triggering speech_stopped'
             )
+            self._consecutive_incomplete_count = 0
             return True
         else:
-            # Incomplete: 用户还在思考/犹豫
+            self._consecutive_incomplete_count += 1
             logger.info(
-                f"[SmartTurn] ⏳ Incomplete (prob={result['probability']:.4f}), "
-                f"重置静音计数，继续等待"
+                f'[SmartTurn] Incomplete (prob={result["probability"]:.4f}), '
+                f'consecutive={self._consecutive_incomplete_count}/{self._max_consecutive_incomplete}, '
+                f'resetting silence counter'
             )
             return False
+
     
     def process(self, pcm16_bytes: bytes) -> list[str]:
         """Process a frame of PCM16 audio, return event list.
@@ -1173,6 +1203,7 @@ class SileroVADModule:
                     self._speech_start_time = None
                     self._last_silence_start_time = None
                     self._turn_audio_chunks = []
+                    self._consecutive_incomplete_count = 0
                     events.append("speech_stopped")
                     events.append("max_duration_reached")
         

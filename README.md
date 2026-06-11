@@ -57,10 +57,13 @@ cp config.yaml.example config.yaml
 | `services.omni.api_key` | Omni API Key（可选，null 则不发送） | `null` |
 | `services.asr.local_asr` | 是否使用本地 ASR | `true` |
 | `services.asr.asr_model_path` | 本地 ASR 模型路径 | `./models/sherpa-onnx-sense-voice-small` |
-| `services.tts.base_url` | TTS HTTP API 地址 | `http://localhost:8091/v1` |
+| `services.tts.base_url` | TTS API 地址（需含 /v1 前缀） | `http://localhost:8091/v1` |
+| `services.tts.model` | TTS 后端 (`Qwen3-TTS`/`voxcpm2`/`gsv-tts-lite`) | `Qwen3-TTS` |
+| `services.tts.mode` | TTS 调用模式 (`http`/`ws`，Qwen3-TTS 和 VoxCPM2 均支持） | `http` |
 | `services.tts.api_key` | TTS API Key（可选，null 则不发送，HTTP/WS 共用） | `null` |
-| `services.tts.mode` | TTS 调用模式 (`http`/`ws`) | `http` |
-| `services.gsv_tts.enabled` | 是否启用 GSV-TTS-Lite 语音合成 | `false` |
+| `services.tts.voice` | 默认音色（Qwen3-TTS 预设音色 / VoxCPM2 填 default） | `vivian` |
+| `services.tts.ref_audio` | 声音克隆参考音频路径或 URL（可选） | `null` |
+| `services.tts.ref_text` | 声音克隆参考音频转录文本（可选） | `null` |
 
 > 详细配置说明见 `config.yaml.example`，每项均有中文注释。
 
@@ -188,13 +191,23 @@ asyncio.run(main())
 | 服务 | 用途 | 默认地址 |
 |------|------|----------|
 | Omni 多模态模型 | LLM 推理（A/B 模式通用） | `http://localhost:8000/v1` |
-| TTS 服务 | 语音合成（Qwen3-TTS） | `http://localhost:8091/v1` |
-| GSV-TTS-Lite | 流式推理 TTS（可选，仅 /tts/stream） | `http://localhost:8001` |
+| Qwen3-TTS | 语音合成（预设音色 + 声音克隆，24kHz） | `http://localhost:8091/v1` |
+| VoxCPM2 | 语音合成（音色克隆 + 情感指令，48kHz→24kHz） | `http://localhost:8093/v1` |
+| GSV-TTS-Lite | 语音合成（音色风格解耦，32kHz，可选） | `http://localhost:8001` |
 | 远程 ASR | 语音识别（local_asr=false 时） | `http://localhost:8082/v1` |
 
-Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。
+Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。三种 TTS 后端通过 `services.tts.model` 切换，均支持 HTTP 分句流式和 WebSocket 逐字流式两种模式。
 
 ## 更新记录
+
+### 2026-06-11
+
+- **声音克隆**：Qwen3-TTS 和 VoxCPM2 均支持 `ref_audio`/`ref_text` 声音克隆配置
+  - 配置统一：`services.tts.ref_audio` + `services.tts.ref_text`
+  - Qwen3-TTS：`ref_audio`/`ref_text` 直接传递给 API
+  - VoxCPM2：`ref_audio`/`ref_text` 直接传递给 API（传 `ref_text` 启用终极克隆模式）
+- **增加TTS支持**: 新增VoxCPM2 TTS支持 基于vllm-omni部署的标准openai接口
+  - 流式推理：输出 48kHz PCM16 自动 2:1 decimation 到 24kHz
 
 ### 2026-05-30
 

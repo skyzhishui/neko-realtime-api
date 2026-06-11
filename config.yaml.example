@@ -165,21 +165,30 @@ services:
     asr_model_path: ./models/sherpa-onnx-sense-voice-small
 
   # ---- TTS 语音合成服务 ----
+  # 支持三种 TTS 后端，通过 model 字段切换:
+  #   Qwen3-TTS: 预设音色 + 声音克隆，24kHz 输出
+  #   voxcpm2:   零样本/声音克隆 + 内联情感指令，48kHz 输出（自动降采样到 24kHz）
+  #   gsv-tts-lite: 音色风格解耦的语音克隆，32kHz 输出
   tts:
-    # TTS HTTP API 基础地址（mode=http 时使用）
+    # TTS HTTP API 基础地址
     # 兼容 OpenAI Speech 接口: POST {base_url}/audio/speech
+    # 需包含 /v1 前缀，如 http://localhost:8091/v1
     base_url: http://localhost:8091/v1
 
     # TTS WebSocket 流式地址（mode=ws 时使用）
-    # 逐字流式合成，延迟更低
+    # 逐字流式合成，首音频延迟更低
     ws_url: ws://localhost:8091/v1/audio/speech/stream
 
     # TTS 调用模式
     # - http: 分句 HTTP 模式，LLM 输出按标点分句后逐句请求 TTS ✅
-    # - ws:   WebSocket 逐字流式模式，LLM 每个 token 即时送 TTS，首音频延迟更低 ✅
+    # - ws:   WebSocket 逐字流式模式，LLM 每个 token 即时送 TTS ✅
+    # Qwen3-TTS 和 VoxCPM2 均支持 http 和 ws 两种模式
     mode: http
 
-    # TTS 模型名称
+    # TTS 模型名称（决定使用哪个 TTS 后端）
+    # - Qwen3-TTS:    基于 vllm-omni 的 Qwen3-TTS，预设音色（vivian/ryan 等）+ 声音克隆
+    # - voxcpm2:      基于 vllm-omni 的 VoxCPM2，零样本合成 + 声音克隆 + 内联情感指令
+    # - gsv-tts-lite: GSV-TTS-Lite 音色风格解耦（需额外配置 gsv_tts 节）
     model: Qwen3-TTS
 
     # API Key（可选），用于 OpenAI 兼容接口认证
@@ -189,18 +198,17 @@ services:
     api_key: null
 
     # 默认音色名称（可被客户端 session.update 覆盖）
-    # 取决于 TTS 后端支持的音色
-    voice: hutao
+    # Qwen3-TTS 预设音色: vivian, serena, sohee, ono_anna, ryan, aiden, dylan, eric, uncle_fu
+    # VoxCPM2: 填 "default"（零样本模式，音色由 ref_audio 或内联指令决定）
+    voice: vivian
 
-    # 音频输出格式
-    # - pcm: 原始 PCM 数据（低延迟，适合实时流式）
+    # 音频输出格式（固定 pcm，用于实时流式）
     response_format: pcm
 
-    # 是否启用流式输出
+    # 是否启用流式输出（固定 true）
     stream: true
 
-    # 流式输出格式（stream=true 时生效）
-    # - audio: 直接输出音频数据
+    # 流式输出格式（固定 audio）
     stream_format: audio
 
     # TTS 语言设置
@@ -210,22 +218,31 @@ services:
     language: Chinese
 
     # TTS 输出采样率（Hz）
-    # Qwen3-TTS 固定输出 24000Hz
+    # Qwen3-TTS 固定输出 24000Hz，VoxCPM2 输出 48000Hz 后自动降采样到 24000Hz
     sample_rate: 24000
 
     # TTS 请求超时时间（秒）
     timeout_s: 15
 
+    # ---- 声音克隆配置（Qwen3-TTS 和 VoxCPM2 通用） ----
+    # 留空或注释则不使用声音克隆，使用预设音色或零样本模式
+    # ref_audio: 参考音频文件路径或 URL
+    #   - 本地文件路径: /path/to/reference.wav（自动读取并转 base64 data URL）
+    #   - HTTP URL: https://example.com/reference.wav（直接传递）
+    #   - Base64 data URL: data:audio/wav;base64,...（直接传递）
+    #   - 要求: 3~30 秒清晰语音，24kHz 单声道（Qwen3-TTS）/ 任意采样率（VoxCPM2）
+    # ref_text: 参考音频对应的转录文本
+    #   - Qwen3-TTS: 可选（不传则仅用参考音频音色）
+    #   - VoxCPM2:   可选（传了则启用终极克隆模式，克隆效果最强）
+    # ref_audio: /path/to/reference.wav
+    # ref_text: "参考音频对应的转录文本"
+
   # ---- GSV-TTS-Lite 语音克隆 TTS 配置 ----
-  # 当 services.tts.mode 为 http 且 gsv_tts.enabled=true 时，
-  # 会使用 GSV-TTS-Lite 替代 Qwen3-TTS 进行语音合成
-  # GSV-TTS-Lite 使用 HTTP POST + SSE（非 WebSocket）
+  # 当 services.tts.model = gsv-tts-lite 时使用此配置
+  # GSV-TTS-Lite 使用 HTTP POST + SSE（非 WebSocket，mode 固定为 http）
   # 音频输出: int16 PCM 32kHz，自动重采样到 tts_pipeline.output_sample_rate
   # 特性: 音色风格解耦（speaker_audio + prompt_audio）、自动 ASR
   gsv_tts:
-    # 是否启用 GSV-TTS-Lite（启用后会替代 Qwen3-TTS）
-    enabled: false
-
     # GSV-TTS-Lite API 基础地址
     base_url: http://localhost:8001
 

@@ -4,6 +4,7 @@ import re
 import asyncio
 import time
 import json
+import base64
 import logging
 from typing import AsyncIterator
 
@@ -18,9 +19,11 @@ class TTSPipeline:
     1. LLM outputs text delta -> buffer
     2. SentenceSplitter detects complete sentences -> split
     3. For each sentence, initiate HTTP streaming TTS request
-    4. Receive WAV stream -> skip 44-byte header -> yield PCM 24kHz directly
+    4. Receive PCM stream -> yield PCM 24kHz directly (no WAV header)
     
-    Output audio format: PCM16 24kHz mono
+    Output audio format: PCM16 24kHz mono (raw binary stream)
+    
+    Supports voice cloning via ref_audio/ref_text.
     """
 
     # Sentence splitting punctuation
@@ -35,7 +38,7 @@ class TTSPipeline:
         r"\u3001\u3002"                 # 、。
         r"\uff01\uff08\uff09\uff0c"     # ！（），
         r"\uff1a\uff1b\uff1f"           # ：；？
-        r"\u201c\u201d\u2018\u2019"     # “”‘’
+        r"\u201c\u201d\u2018\u2019"     # ""''
         r"\u3010\u3011"                 # 【】
         r"\u300a\u300b"                 # 《》
         r"\u2026\u2014\u00b7"           # …—·
@@ -45,11 +48,13 @@ class TTSPipeline:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8091",
+        base_url: str = "http://localhost:8091/v1",
         voice: str = "Vivian",
         sample_rate_out: int = 24000,
         timeout_s: int = 15,
         api_key: str | None = None,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
     ):
         self.base_url = base_url
         self.voice = voice
@@ -58,6 +63,10 @@ class TTSPipeline:
         self.timeout_s = timeout_s
         self.api_key = api_key
         self._session: aiohttp.ClientSession | None = None
+
+        # Voice cloning (ref_audio/ref_text)
+        self.ref_audio = self._resolve_ref_audio(ref_audio)
+        self.ref_text = ref_text
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -71,28 +80,70 @@ class TTSPipeline:
         stripped = TTSPipeline.PUNCTUATION_WHITESPACE_RE.sub("", text)
         return len(stripped) == 0
 
+    @staticmethod
+    def _resolve_ref_audio(ref_audio: str | None) -> str | None:
+        """Resolve ref_audio to a format suitable for the API.
+
+        If ref_audio is a local file path (no scheme like http://, https://, data:, file://),
+        read the file and convert to a base64 data URL.
+        Otherwise, return as-is (already an HTTP URL, data URL, or file:// URI).
+        """
+        if ref_audio is None:
+            return None
+
+        # If it already has a scheme, return as-is
+        if "://" in ref_audio:
+            return ref_audio
+
+        # Treat as a local file path
+        from pathlib import Path
+        path = Path(ref_audio)
+        if not path.exists():
+            logger.warning(f"ref_audio file not found: {ref_audio}, using as-is")
+            return ref_audio
+
+        try:
+            audio_bytes = path.read_bytes()
+            b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            suffix = path.suffix.lower().lstrip(".")
+            mime_map = {
+                "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+                "ogg": "audio/ogg", "aac": "audio/aac", "pcm": "audio/pcm",
+            }
+            mime_type = mime_map.get(suffix, "audio/wav")
+            data_url = f"data:{mime_type};base64,{b64}"
+            logger.info(f"ref_audio: loaded local file {ref_audio} ({len(audio_bytes)} bytes) -> base64 data URL")
+            return data_url
+        except Exception as e:
+            logger.error(f"Failed to read ref_audio file {ref_audio}: {e}")
+            return ref_audio
+
     async def stream_tts(
         self,
         text: str,
         instructions: str = "",
         language: str = "Chinese",
     ) -> AsyncIterator[bytes]:
-        """Single sentence HTTP streaming TTS, yields PCM16 24kHz bytes."""
+        """Single sentence HTTP streaming TTS, yields PCM16 24kHz bytes (raw stream, no WAV header)."""
         payload = {
             "model": "Qwen3-TTS",
             "voice": self.voice,
             "input": text,
-            "response_format": "wav",
+            "response_format": "pcm",
             "stream": True,
             "language": language,
         }
         if instructions:
             payload["instructions"] = instructions
 
+        # Voice cloning
+        if self.ref_audio:
+            payload["ref_audio"] = self.ref_audio
+            if self.ref_text:
+                payload["ref_text"] = self.ref_text
+
         t_tts_sent = time.time()
         first_chunk_logged = False
-        wav_header_skipped = False
-        leftover = b""
         session = await self._get_session()
         headers = {}
         if self.api_key:
@@ -110,20 +161,6 @@ class TTSPipeline:
                     return
                 
                 async for chunk in resp.content.iter_chunked(4096):
-                    if not wav_header_skipped:
-                        if len(chunk) > 44:
-                            chunk = chunk[44:]
-                        else:
-                            continue
-                        wav_header_skipped = True
-                    
-                    chunk = leftover + chunk
-                    leftover = b""
-
-                    if len(chunk) % 2 != 0:
-                        leftover = chunk[-1:]
-                        chunk = chunk[:-1]
-
                     if chunk:
                         if not first_chunk_logged:
                             latency_ms = (time.time() - t_tts_sent) * 1000
@@ -131,6 +168,9 @@ class TTSPipeline:
                             first_chunk_logged = True
                         yield chunk
 
+        except asyncio.CancelledError:
+            logger.info("[Qwen3-TTS] stream_tts cancelled")
+            raise
         except Exception as e:
             logger.error(f"TTS streaming error: {e}")
 

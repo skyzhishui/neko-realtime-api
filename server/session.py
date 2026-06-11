@@ -31,6 +31,8 @@ from .local_asr import LocalASREngine
 from .tts_pipeline import TTSPipeline, SentenceSplitter
 from .tts_ws_pipeline import TTSWebSocketPipeline
 from .gsv_tts_pipeline import GsvTtsPipeline
+from .voxcpm2_tts_pipeline import VoxCpm2TtsPipeline, VoxCpm2TtsWsPipeline
+from .text_processor import InlineDirectiveStripper
 from .interruption import InterruptionHandler
 from .config import ServerConfig
 
@@ -179,17 +181,32 @@ class RealtimeSession:
                 logger.info(f"[Session] Initializing LocalASREngine with model_path={asr_model_path}, device={asr_device}")
                 self.local_asr = LocalASREngine(model_path=asr_model_path, device=asr_device)
         
-        self.tts_pipeline = TTSPipeline(
-            base_url=config.get("services", "tts", "base_url", default="http://localhost:8091/v1"),
-            voice=self.session_config.voice,  # C1 fix: 使用 session_config.voice
-            sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
-            timeout_s=config.get("services", "tts", "timeout_s", default=15),
-            api_key=config.get("services", "tts", "api_key", default=None),
-        )
-        
-        # GSV-TTS-Lite pipeline (optional, voice cloning TTS)
-        self.gsv_tts_enabled = config.get("services", "gsv_tts", "enabled", default=False)
-        if self.gsv_tts_enabled:
+        # TTS model routing: services.tts.model determines which pipeline to use
+        # Qwen3-TTS (default) | voxcpm2 | gsv-tts-lite
+        tts_model = config.get("services", "tts", "model", default="Qwen3-TTS")
+
+        if tts_model == "voxcpm2":
+            self.tts_pipeline = VoxCpm2TtsPipeline(
+                base_url=config.get("services", "tts", "base_url", default="http://localhost:8093/v1"),
+                voice=config.get("services", "tts", "voice", default="default"),
+                timeout_s=config.get("services", "tts", "timeout_s", default=30),
+                api_key=config.get("services", "tts", "api_key", default=""),
+                ref_audio=config.get("services", "tts", "ref_audio", default=None),
+                ref_text=config.get("services", "tts", "ref_text", default=None),
+            )
+            self.directive_stripper = InlineDirectiveStripper()
+            self.tts_mode = config.get("services", "tts", "mode", default="http")
+            self.gsv_tts_pipeline = None
+            logger.info(f"[Session] VoxCPM2 TTS enabled: base_url={self.tts_pipeline.base_url}, mode={self.tts_mode}")
+
+        elif tts_model == "gsv-tts-lite":
+            self.tts_pipeline = TTSPipeline(
+                base_url=config.get("services", "tts", "base_url", default="http://localhost:8091/v1"),
+                voice=self.session_config.voice,
+                sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
+                timeout_s=config.get("services", "tts", "timeout_s", default=15),
+                api_key=config.get("services", "tts", "api_key", default=None),
+            )
             self.gsv_tts_pipeline = GsvTtsPipeline(
                 base_url=config.get("services", "gsv_tts", "base_url", default="http://localhost:8001"),
                 speaker_audio=config.get("services", "gsv_tts", "speaker_audio", default=""),
@@ -199,12 +216,23 @@ class RealtimeSession:
                 timeout_s=config.get("services", "gsv_tts", "timeout_s", default=30),
                 speed=config.get("services", "gsv_tts", "speed", default=1.0),
             )
+            self.directive_stripper = None
+            self.tts_mode = "http"  # GSV-TTS-Lite forced HTTP mode
             logger.info(f"[Session] GSV-TTS-Lite enabled: base_url={self.gsv_tts_pipeline.base_url}")
-        else:
+
+        else:  # Qwen3-TTS (default)
+            self.tts_pipeline = TTSPipeline(
+                base_url=config.get("services", "tts", "base_url", default="http://localhost:8091/v1"),
+                voice=self.session_config.voice,
+                sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
+                timeout_s=config.get("services", "tts", "timeout_s", default=15),
+                api_key=config.get("services", "tts", "api_key", default=None),
+                ref_audio=config.get("services", "tts", "ref_audio", default=None),
+                ref_text=config.get("services", "tts", "ref_text", default=None),
+            )
+            self.directive_stripper = None
             self.gsv_tts_pipeline = None
-        
-        # TTS mode: "http" (default, sentence-based) or "ws" (character-by-character streaming)
-        self.tts_mode = config.get("services", "tts", "mode", default="http")
+            self.tts_mode = config.get("services", "tts", "mode", default="http")
         self.tts_ws_url = config.get("services", "tts", "ws_url", default="ws://localhost:8091/v1/audio/speech/stream")
         # C1 fix: 删除 self.tts_voice/tts_language/tts_sample_rate/tts_timeout_s
         # voice 统一从 session_config.voice 读取，language/sample_rate/timeout 从 config 读取
@@ -343,48 +371,27 @@ class RealtimeSession:
                         await self.protocol.send_response_done(self._current_resp_id)
                         self._current_resp_id = None
                     
-                    # 3. 设置 _is_responding = False
-                    self._is_responding = False
-                   
-                    # 4. 把预缓冲数据存下来
-                    prefix_audio = self.vad.get_prefix_audio()
-
-                    # 5. 清空旧的 audio_buffer（包括残留的图片数据）
-                    self.audio_buffer.clear_audio()
-                    self.audio_buffer.clear_images()
+                    # 3. 在 _response_lock 内设置 _is_responding = False（防止与 speech_stopped 竞态）
+                    async with self._response_lock:
+                        self._is_responding = False
                     
-                    # 6. 先写回预缓冲音频（用户语音起始前的~300ms），再写当前帧                    
+                    # 4. 写入 prefix_audio（speech_started之前的~300ms，不写则吞字）
+                    prefix_audio = self.vad.get_prefix_audio()
                     if prefix_audio:
                         self.audio_buffer.append_audio_raw(prefix_audio)
-                    self.audio_buffer.append_audio_raw(pcm_bytes)
+                        prefix_ms = len(prefix_audio) / 2 / (self.vad.sample_rate / 1000)
+                        logger.info(
+                            f"[Session] Interruption: prefix padding {prefix_ms:.0f}ms "
+                            f"({len(prefix_audio)} bytes) written to audio_buffer"
+                        )
                     
-                    # 7. 完全重置VAD状态（清空所有内部状态，包括LSTM、prefix_chunks等）
-                    self.vad.reset()
-                    logger.info(
-                        f"[Session] Interruption: current frame ({len(pcm_bytes)} bytes) "
-                        f"written to audio_buffer as speech start"
-                    )
-                    
-                    # 7. 设置语音活跃状态
+                    # 5. 设 _is_speech_active=True，让后续帧继续写入audio_buffer直到VAD自然触发speech_stopped
                     self._is_speech_active = True
                     
-                    # 8. 发送 speech_started 给客户端
+                    # 6. 通知客户端语音开始（与后续speech_stopped配对）
                     await self.protocol.send_speech_started()
                     
-                    # 9. 初始化 Smart Turn 音频缓冲
-                    if self.vad.smart_turn_enabled and self.vad._smart_turn is not None:
-                        all_audio_pcm = self.audio_buffer.get_full_pcm()
-                        if len(all_audio_pcm) > 0:
-                            turn_audio_np = np.frombuffer(all_audio_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                            self.vad._turn_audio_chunks = [turn_audio_np.copy()]
-                            
-                            #turn_ms = len(turn_audio_np) / self.vad.sample_rate * 1000
-                            #logger.info(
-                            #    f"[Session] Interruption: Smart Turn buffer initialized "
-                            #    f"with {len(turn_audio_np)} samples ({turn_ms:.0f}ms)"
-                            #)
-                    
-                    logger.info("[Session] Interruption completed, VAD reset, ready for new speech input")
+                    logger.info("[Session] Interruption completed, VAD continues naturally")
                 else:
                     # ---- 非响应期间的正常 speech_started 处理 ----
                     # 正常语音开始
@@ -496,9 +503,14 @@ class RealtimeSession:
             self._is_responding = True
         
         if self.audio_buffer.get_full_pcm():
-            asyncio.create_task(self._process_speech_input())
+            self._active_pipeline_task = asyncio.create_task(self._process_speech_input())
         elif self.conversation:
-            asyncio.create_task(self._process_text_input())
+            self._active_pipeline_task = asyncio.create_task(self._process_text_input())
+        else:
+            # 无音频且无对话历史时，重置状态避免卡死
+            logger.warning("response.create with no audio buffer and no conversation, resetting state")
+            async with self._response_lock:
+                self._is_responding = False
 
     async def _handle_response_cancel(self, event: dict):
         """Handle response.cancel event."""
@@ -506,7 +518,8 @@ class RealtimeSession:
         if self._current_resp_id:
             await self.protocol.send_response_done(self._current_resp_id)
             self._current_resp_id = None
-        self._is_responding = False
+        async with self._response_lock:
+            self._is_responding = False
 
     # ----------------------------------------------------------------
     # 公共流式管线方法：LLM → TTS 流式处理（支持 tool calling）
@@ -536,9 +549,9 @@ class RealtimeSession:
             return await self._stream_llm_with_tool_loop(messages, resp_id)
 
         if self.tts_mode == "ws":
-            return await self._stream_llm_to_tts_ws(messages, resp_id)
+            return await self._stream_llm_events_to_tts_ws(messages, resp_id)
         else:
-            return await self._stream_llm_to_tts_http(messages, resp_id)
+            return await self._stream_llm_events_to_tts_http(messages, resp_id)
 
     # ---- Tool calling lifecycle ----
 
@@ -626,6 +639,13 @@ class RealtimeSession:
                         await self.protocol.send_error(f"Tool result timeout for {tc['name']}")
                         del self._tool_result_events[call_id]
                         full_response_text = "".join(text_parts)
+                        # 为当前超时的 tool call 补充 placeholder error result，
+                        # 确保 conversation history 中每个 tool_call 都有对应 tool result
+                        current_messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": f"error: tool result timeout for {tc['name']}",
+                        })
                         break
                     except asyncio.CancelledError:
                         # Pipeline cancelled while waiting for tool result — clean up
@@ -688,19 +708,28 @@ class RealtimeSession:
         max_concurrent = self.config.get("tts_pipeline", "max_concurrent_tts", default=2)
         tts_semaphore = asyncio.Semaphore(max_concurrent)
 
+        # Determine active TTS pipeline for this session
+        tts_model = self.config.get("services", "tts", "model", default="Qwen3-TTS")
+        active_tts_pipeline = self.gsv_tts_pipeline if tts_model == "gsv-tts-lite" else self.tts_pipeline
+
         sentence_audio_queues: list[asyncio.Queue[bytes | None]] = []
         tts_tasks: list[asyncio.Task] = []
         all_sentences_enqueued = False
 
         async def _process_sentence_tts(sentence: str, queue: asyncio.Queue):
             async with tts_semaphore:
-                tts_pipe = self.gsv_tts_pipeline if self.gsv_tts_enabled else self.tts_pipeline
                 try:
-                    async for pcm_chunk in tts_pipe.stream_tts(
-                        sentence,
-                        **({} if self.gsv_tts_enabled else {"instructions": ""}),
-                    ):
-                        await queue.put(pcm_chunk)
+                    if tts_model == "gsv-tts-lite":
+                        async for pcm_chunk in active_tts_pipeline.stream_tts(sentence):
+                            await queue.put(pcm_chunk)
+                    elif tts_model == "voxcpm2":
+                        async for pcm_chunk in active_tts_pipeline.stream_tts(sentence):
+                            await queue.put(pcm_chunk)
+                    else:  # Qwen3-TTS
+                        async for pcm_chunk in active_tts_pipeline.stream_tts(
+                            sentence, instructions="",
+                        ):
+                            await queue.put(pcm_chunk)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -733,7 +762,14 @@ class RealtimeSession:
                 if event["type"] == "text":
                     text_delta = event["delta"]
                     full_text += text_delta
-                    await self.protocol.send_transcript_delta(text_delta)
+                    # Directive stripping: raw text → TTS (preserves directives),
+                    # stripped text → client transcript (removes directives for voxcpm2)
+                    if self.directive_stripper:
+                        clean_text = self.directive_stripper.feed(text_delta)
+                    else:
+                        clean_text = text_delta
+                    if clean_text:
+                        await self.protocol.send_transcript_delta(clean_text)
                     # Only send text to TTS if no tool calls detected yet in this round
                     if not has_tool_calls:
                         sentences = splitter.add_text(text_delta)
@@ -816,14 +852,28 @@ class RealtimeSession:
         finish_reason = "stop"
         has_tool_calls = False
 
-        ws_pipeline = TTSWebSocketPipeline(
-            ws_url=self.tts_ws_url,
-            voice=self.session_config.voice,
-            sample_rate=self.config.get("services", "tts", "sample_rate", default=24000),
-            language=self.config.get("services", "tts", "language", default="Chinese"),
-            timeout_s=self.config.get("services", "tts", "timeout_s", default=15),
-            api_key=self.config.get("services", "tts", "api_key", default=None),
-        )
+        tts_model_ws = self.config.get("services", "tts", "model", default="Qwen3-TTS")
+        if tts_model_ws == "voxcpm2":
+            ws_pipeline = VoxCpm2TtsWsPipeline(
+                ws_url=self.tts_ws_url,
+                voice=self.session_config.voice,
+                sample_rate=self.config.get("services", "tts", "sample_rate", default=24000),
+                timeout_s=self.config.get("services", "tts", "timeout_s", default=15),
+                api_key=self.config.get("services", "tts", "api_key", default=None),
+                ref_audio=self.tts_pipeline.ref_audio if hasattr(self.tts_pipeline, 'ref_audio') else None,
+                ref_text=self.tts_pipeline.ref_text if hasattr(self.tts_pipeline, 'ref_text') else None,
+            )
+        else:
+            ws_pipeline = TTSWebSocketPipeline(
+                ws_url=self.tts_ws_url,
+                voice=self.session_config.voice,
+                sample_rate=self.config.get("services", "tts", "sample_rate", default=24000),
+                language=self.config.get("services", "tts", "language", default="Chinese"),
+                timeout_s=self.config.get("services", "tts", "timeout_s", default=15),
+                api_key=self.config.get("services", "tts", "api_key", default=None),
+                ref_audio=self.tts_pipeline.ref_audio if hasattr(self.tts_pipeline, 'ref_audio') else None,
+                ref_text=self.tts_pipeline.ref_text if hasattr(self.tts_pipeline, 'ref_text') else None,
+            )
 
         tts_first_chunk_received = False
         tts_receive_done = asyncio.Event()
@@ -862,7 +912,13 @@ class RealtimeSession:
                 if event["type"] == "text":
                     text_delta = event["delta"]
                     full_text += text_delta
-                    await self.protocol.send_transcript_delta(text_delta)
+                    # Directive stripping for voxcpm2
+                    if self.directive_stripper:
+                        clean_text = self.directive_stripper.feed(text_delta)
+                    else:
+                        clean_text = text_delta
+                    if clean_text:
+                        await self.protocol.send_transcript_delta(clean_text)
 
                     if not llm_first_token:
                         llm_first_token = True
@@ -956,6 +1012,8 @@ class RealtimeSession:
         self.audio_buffer.clear_audio()
         self.audio_buffer.clear_images()
         
+        my_task = asyncio.current_task()
+        
         try:
             self._is_speech_active = False
             
@@ -966,16 +1024,16 @@ class RealtimeSession:
             else:
                 await self._process_mode_a(captured_pcm, captured_duration_ms, captured_images)
         except asyncio.CancelledError:
-            # Pipeline 被取消（用户打断），不发送 response.done（由取消方负责）
             logger.info("[Session] _process_speech_input cancelled, pipeline interrupted")
             raise
         except Exception as e:
             logger.error(f"Error processing speech input: {e}", exc_info=True)
             await self.protocol.send_error(f"Processing error: {str(e)}")
         finally:
-            self._is_responding = False
+            if self._active_pipeline_task is my_task:
+                self._is_responding = False
+                self._active_pipeline_task = None
             self.interruption.set_generating(False)
-            self._is_speech_active = False
 
     async def _process_mode_b(self, captured_pcm: bytes, duration_ms: float, captured_images: list[str] | None = None):
         """Mode B: Omni audio input + TTS output.
@@ -1028,9 +1086,9 @@ class RealtimeSession:
                 await self.protocol.send_error("Omni error, falling back to ASR mode")
             else:
                 await self.protocol.send_error(f"Mode B error: {str(e)}")
-            # 异常时不发送 transcript_done / response.done
-            # 客户端通过 error 事件感知错误
-            self._current_resp_id = None
+            if self._current_resp_id:
+                await self.protocol.send_response_done(self._current_resp_id)
+                self._current_resp_id = None
             return
         
         await self.protocol.send_transcript_done()
@@ -1102,8 +1160,9 @@ class RealtimeSession:
         except Exception as e:
             logger.error(f"Mode A LLM error: {e}", exc_info=True)
             await self.protocol.send_error(f"Mode A LLM error: {str(e)}")
-            # 异常时不发送 transcript_done / response_done
-            self._current_resp_id = None
+            if self._current_resp_id:
+                await self.protocol.send_response_done(self._current_resp_id)
+                self._current_resp_id = None
             return
         
         await self.protocol.send_transcript_done()
@@ -1113,6 +1172,8 @@ class RealtimeSession:
     async def _process_text_input(self):
         """Process text-only conversation input."""
         # _is_responding 已由调用方在 _response_lock 内原子性设置
+        
+        my_task = asyncio.current_task()
         
         try:
             messages = self._build_text_messages()
@@ -1135,8 +1196,13 @@ class RealtimeSession:
             except Exception as e:
                 logger.error(f"Text input error: {e}", exc_info=True)
                 await self.protocol.send_error(f"Processing error: {str(e)}")
+                if self._current_resp_id:
+                    await self.protocol.send_response_done(self._current_resp_id)
+                    self._current_resp_id = None
         finally:
-            self._is_responding = False
+            if self._active_pipeline_task is my_task:
+                self._is_responding = False
+                self._active_pipeline_task = None
             self.interruption.set_generating(False)
 
     def _build_base_messages(self) -> list[dict]:
@@ -1248,5 +1314,9 @@ class RealtimeSession:
         await self.tts_pipeline.close()
         if self.gsv_tts_pipeline:
             await self.gsv_tts_pipeline.close()
+        
+        # Flush directive stripper on session cleanup
+        if self.directive_stripper:
+            self.directive_stripper.reset()
         
         self._vad_executor.shutdown(wait=False)

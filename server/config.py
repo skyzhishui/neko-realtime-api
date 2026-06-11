@@ -51,7 +51,7 @@ _DEFAULT_CONFIG = {
             "base_url": "http://localhost:8091",
             "ws_url": "ws://localhost:8091/v1/audio/speech/stream",
             "mode": "http",
-            "model": "Qwen3-TTS",
+            "model": "Qwen3-TTS",       # Route key: Qwen3-TTS | voxcpm2 | gsv-tts-lite
             "api_key": None,
             "voice": "Vivian",
             "response_format": "pcm",
@@ -60,9 +60,10 @@ _DEFAULT_CONFIG = {
             "language": "Chinese",
             "sample_rate": 24000,
             "timeout_s": 15,
+            "ref_audio": None,      # 声音克隆：参考音频文件路径或URL（Qwen3-TTS和VoxCPM2均使用ref_audio）
+            "ref_text": None,       # 声音克隆：参考音频转录文本（Qwen3-TTS和VoxCPM2均使用ref_text）
         },
         "gsv_tts": {
-            "enabled": False,
             "base_url": "http://localhost:8001",
             "speaker_audio": "",
             "prompt_audio": "",
