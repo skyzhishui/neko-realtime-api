@@ -2,9 +2,70 @@
 import json
 import base64
 import logging
+import uuid
 from fastapi import WebSocket
 
 logger = logging.getLogger("realtime-server")
+
+
+def _build_session_object(session_config) -> dict:
+    """Build an OpenAI-Realtime-API-compliant session object.
+    
+    Args:
+        session_config: A SessionConfig instance (from session.py).
+    """
+    return {
+        "id": f"sess_{uuid.uuid4().hex[:24]}",
+        "object": "realtime.session",
+        "model": getattr(session_config, "_model", "local-qwen-omni"),
+        "modalities": getattr(session_config, "modalities", ["text", "audio"]),
+        "voice": getattr(session_config, "voice", "Vivian"),
+        "input_audio_format": getattr(session_config, "input_audio_format", "pcm16"),
+        "output_audio_format": getattr(session_config, "output_audio_format", "pcm16"),
+        "instructions": getattr(session_config, "instructions", ""),
+        "turn_detection": getattr(session_config, "turn_detection", {}),
+        "tools": getattr(session_config, "tools", []) or [],
+        "tool_choice": "auto",
+        "temperature": getattr(session_config, "temperature", 0.7),
+        "max_response_output_tokens": "inf",
+    }
+
+
+def _build_usage_object(usage: dict | None = None) -> dict:
+    """Build an OpenAI-Realtime-API-compliant usage object.
+    
+    If usage is provided with partial keys, fill in missing ones with zeros.
+    If usage is None, return a full zero-usage object.
+    """
+    template = {
+        "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "input_token_details": {
+            "text_tokens": 0,
+            "audio_tokens": 0,
+            "cached_tokens": 0,
+        },
+        "output_token_details": {
+            "text_tokens": 0,
+            "audio_tokens": 0,
+        },
+    }
+    if usage is None:
+        return template
+    result = template.copy()
+    for key in ("total_tokens", "input_tokens", "output_tokens"):
+        if key in usage:
+            result[key] = usage[key]
+    if "input_token_details" in usage and isinstance(usage["input_token_details"], dict):
+        for k in ("text_tokens", "audio_tokens", "cached_tokens"):
+            if k in usage["input_token_details"]:
+                result["input_token_details"][k] = usage["input_token_details"][k]
+    if "output_token_details" in usage and isinstance(usage["output_token_details"], dict):
+        for k in ("text_tokens", "audio_tokens"):
+            if k in usage["output_token_details"]:
+                result["output_token_details"][k] = usage["output_token_details"][k]
+    return result
 
 
 class ProtocolAdapter:
@@ -65,23 +126,39 @@ class ProtocolAdapter:
     async def send_transcript_done(self):
         await self.send({"type": "response.output_audio_transcript.done"})
 
-    async def send_response_done(self, resp_id: str, usage: dict | None = None):
+    async def send_response_done(self, resp_id: str, status: str = "completed",
+                                   status_details: dict | None = None, usage: dict | None = None):
+        """Send response.done event with OpenAI-Realtime-API-compliant payload.
+        
+        Args:
+            resp_id: Response ID (e.g. "resp_0").
+            status: One of "completed", "cancelled", "incomplete", "failed".
+            status_details: Optional status details object.
+            usage: Optional usage dict; missing keys will be filled with zeros.
+        """
+        response_obj = {
+            "id": resp_id,
+            "object": "realtime.response",
+            "model": "qwen-realtime",
+            "status": status,
+            "usage": _build_usage_object(usage),
+        }
+        if status_details is not None:
+            response_obj["status_details"] = status_details
         await self.send({
             "type": "response.done",
-            "response": {
-                "id": resp_id,
-                "model": "qwen-realtime",
-                "usage": usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-            },
+            "response": response_obj,
         })
 
-    async def send_session_created(self):
-        """Send session.created event to client."""
-        await self.send({"type": "session.created"})
+    async def send_session_created(self, session_config=None):
+        """Send session.created event to client with full session object."""
+        session_obj = _build_session_object(session_config) if session_config else _build_session_object(type("SC", (), {})())
+        await self.send({"type": "session.created", "session": session_obj})
 
-    async def send_session_updated(self):
-        """Send session.updated event to client."""
-        await self.send({"type": "session.updated"})
+    async def send_session_updated(self, session_config=None):
+        """Send session.updated event to client with full session object."""
+        session_obj = _build_session_object(session_config) if session_config else _build_session_object(type("SC", (), {})())
+        await self.send({"type": "session.updated", "session": session_obj})
 
     # ── Tool calling events ─────────────────────────────────────────
 

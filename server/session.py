@@ -38,6 +38,12 @@ from .config import ServerConfig
 
 logger = logging.getLogger("realtime-server")
 
+# ── Input size limits (P0-2) ──────────────────────────────────────────
+MAX_AUDIO_FRAME_B64_BYTES = 5 * 1024 * 1024       # 5 MB base64 per audio frame
+MAX_IMAGE_B64_BYTES = 10 * 1024 * 1024             # 10 MB base64 per image
+MAX_CONVERSATION_ITEMS = 200                        # max items in conversation
+MAX_SESSION_AUDIO_SECONDS = 600.0                   # cumulative input audio per session
+
 
 class SessionConfig:
     """Per-session configuration, updated by session.update events."""
@@ -119,8 +125,18 @@ class RealtimeSession:
         # Protocol adapter
         self.protocol = ProtocolAdapter(websocket)
         
-        # Session config
+        # Session config — stash model name so protocol can use it
         self.session_config = SessionConfig(config=config)
+        self.session_config._model = model
+        
+        # ── Security limits (P0-2) ──────────────────────────────────
+        # Override defaults from config.security if present
+        _sec = config.get("security", default={})
+        self._max_audio_frame_b64 = _sec.get("max_audio_frame_b64", MAX_AUDIO_FRAME_B64_BYTES) if isinstance(_sec, dict) else MAX_AUDIO_FRAME_B64_BYTES
+        self._max_image_b64 = _sec.get("max_image_b64", MAX_IMAGE_B64_BYTES) if isinstance(_sec, dict) else MAX_IMAGE_B64_BYTES
+        self._max_conversation_items = _sec.get("max_conversation_items", MAX_CONVERSATION_ITEMS) if isinstance(_sec, dict) else MAX_CONVERSATION_ITEMS
+        self._max_session_audio_seconds = _sec.get("max_session_audio_seconds", MAX_SESSION_AUDIO_SECONDS) if isinstance(_sec, dict) else MAX_SESSION_AUDIO_SECONDS
+        self._total_input_audio_seconds: float = 0.0
         
         # VAD - use ModelManager preloaded models if available, otherwise fallback to direct init
         from .model_manager import ModelManager
@@ -291,7 +307,7 @@ class RealtimeSession:
                 logger.warning(f"Unknown event type: {event_type}")
         except Exception as e:
             logger.error(f"Error handling event {event_type}: {e}", exc_info=True)
-            await self.protocol.send_error(f"Error processing {event_type}: {str(e)}")
+            await self.protocol.send_error("internal error")
 
     async def _handle_session_update(self, event: dict):
         """Handle session.update event."""
@@ -312,7 +328,7 @@ class RealtimeSession:
                      f"smart_turn_enabled={self.vad.smart_turn_enabled}, "
                      f"tools={[t['function']['name'] for t in self.session_config.tools] if self.session_config.tools else None}")
 
-        await self.protocol.send_session_updated()
+        await self.protocol.send_session_updated(self.session_config)
 
     async def _handle_audio_append(self, event: dict):
         """Handle input_audio_buffer.append event.
@@ -342,6 +358,12 @@ class RealtimeSession:
         if not audio_b64:
             return
         
+        # P0-2: Enforce per-frame audio size limit
+        if len(audio_b64) > self._max_audio_frame_b64:
+            logger.warning(f"Audio frame too large: {len(audio_b64)} > {self._max_audio_frame_b64} bytes, dropping")
+            await self.protocol.send_error("invalid_request_error: audio frame exceeds maximum allowed size")
+            return
+        
         self._audio_chunk_count += 1
         if self._audio_chunk_count % 100 == 1:
             logger.debug(f"Audio stream active: chunk #{self._audio_chunk_count}, {len(audio_b64)} chars base64")
@@ -351,6 +373,15 @@ class RealtimeSession:
             pcm_bytes = base64.b64decode(audio_b64)
         except Exception as e:
             logger.warning(f"Failed to decode audio: {e}")
+            return
+        
+        # P0-2: Track cumulative input audio seconds and reject if over limit
+        frame_duration_s = len(pcm_bytes) / 2 / 16000  # PCM16 = 2 bytes/sample, 16kHz
+        self._total_input_audio_seconds += frame_duration_s
+        if self._total_input_audio_seconds > self._max_session_audio_seconds:
+            logger.warning(f"Session cumulative audio exceeded limit: {self._total_input_audio_seconds:.1f}s > {self._max_session_audio_seconds:.1f}s")
+            await self.protocol.send_error("invalid_request_error: session cumulative input audio duration exceeded")
+            self._total_input_audio_seconds -= frame_duration_s  # revert since we're dropping
             return
         
         # VAD processing (offloaded to avoid blocking event loop)
@@ -368,7 +399,7 @@ class RealtimeSession:
                     
                     # 2. 发送 response.done(cancelled) 给客户端
                     if self._current_resp_id:
-                        await self.protocol.send_response_done(self._current_resp_id)
+                        await self.protocol.send_response_done(self._current_resp_id, status="cancelled")
                         self._current_resp_id = None
                     
                     # 3. 在 _response_lock 内设置 _is_responding = False（防止与 speech_stopped 竞态）
@@ -472,6 +503,11 @@ class RealtimeSession:
         """Handle input_image_buffer.append event."""
         image_b64 = event.get("image", "")
         if image_b64:
+            # P0-2: Enforce per-image size limit
+            if len(image_b64) > self._max_image_b64:
+                logger.warning(f"Image too large: {len(image_b64)} > {self._max_image_b64} bytes, dropping")
+                await self.protocol.send_error("invalid_request_error: image exceeds maximum allowed size")
+                return
             self.audio_buffer.append_image(image_b64)
 
     async def _handle_conversation_item_create(self, event: dict):
@@ -480,9 +516,18 @@ class RealtimeSession:
         item_type = item.get("type", "")
         if item_type == "message":
             role = item.get("role", "user")
+            # P0-7: Reject system role
+            if role == "system":
+                await self.protocol.send_error("invalid_request_error: role 'system' not allowed in conversation.item.create")
+                return
             content = item.get("content", [])
             msg = {"role": role, "content": content}
             self.conversation.append(msg)
+            # P0-2: Enforce conversation length limit (rolling window)
+            if len(self.conversation) > self._max_conversation_items:
+                dropped = len(self.conversation) - self._max_conversation_items
+                self.conversation = self.conversation[dropped:]
+                logger.warning(f"Conversation exceeded {self._max_conversation_items} items, dropped {dropped} oldest")
             logger.info(f"Added conversation item: role={role}")
         elif item_type == "function_call_output":
             call_id = item.get("call_id", "")
@@ -516,7 +561,7 @@ class RealtimeSession:
         """Handle response.cancel event."""
         await self._cancel_active_pipeline("client_cancel")
         if self._current_resp_id:
-            await self.protocol.send_response_done(self._current_resp_id)
+            await self.protocol.send_response_done(self._current_resp_id, status="cancelled")
             self._current_resp_id = None
         async with self._response_lock:
             self._is_responding = False
@@ -1028,7 +1073,7 @@ class RealtimeSession:
             raise
         except Exception as e:
             logger.error(f"Error processing speech input: {e}", exc_info=True)
-            await self.protocol.send_error(f"Processing error: {str(e)}")
+            await self.protocol.send_error("internal error")
         finally:
             if self._active_pipeline_task is my_task:
                 self._is_responding = False
@@ -1085,14 +1130,14 @@ class RealtimeSession:
                 logger.info("Falling back to Mode A after Omni error")
                 await self.protocol.send_error("Omni error, falling back to ASR mode")
             else:
-                await self.protocol.send_error(f"Mode B error: {str(e)}")
+                await self.protocol.send_error("internal error")
             if self._current_resp_id:
-                await self.protocol.send_response_done(self._current_resp_id)
+                await self.protocol.send_response_done(self._current_resp_id, status="failed")
                 self._current_resp_id = None
             return
         
         await self.protocol.send_transcript_done()
-        await self.protocol.send_response_done(resp_id)
+        await self.protocol.send_response_done(resp_id, status="completed")
         self._current_resp_id = None
 
     async def _process_mode_a(self, captured_pcm: bytes, duration_ms: float, captured_images: list[str] | None = None):
@@ -1130,7 +1175,7 @@ class RealtimeSession:
             raise
         except Exception as e:
             logger.error(f"ASR error: {e}", exc_info=True)
-            await self.protocol.send_error(f"ASR error: {str(e)}")
+            await self.protocol.send_error("internal error")
             return
         
         logger.info(f"ASR transcript: {transcript}")
@@ -1159,14 +1204,14 @@ class RealtimeSession:
             raise
         except Exception as e:
             logger.error(f"Mode A LLM error: {e}", exc_info=True)
-            await self.protocol.send_error(f"Mode A LLM error: {str(e)}")
+            await self.protocol.send_error("internal error")
             if self._current_resp_id:
-                await self.protocol.send_response_done(self._current_resp_id)
+                await self.protocol.send_response_done(self._current_resp_id, status="failed")
                 self._current_resp_id = None
             return
         
         await self.protocol.send_transcript_done()
-        await self.protocol.send_response_done(resp_id)
+        await self.protocol.send_response_done(resp_id, status="completed")
         self._current_resp_id = None
 
     async def _process_text_input(self):
@@ -1190,14 +1235,14 @@ class RealtimeSession:
                     self.conversation.append({"role": "assistant", "content": full_text})
                 
                 await self.protocol.send_transcript_done()
-                await self.protocol.send_response_done(resp_id)
+                await self.protocol.send_response_done(resp_id, status="completed")
                 self._current_resp_id = None
                 
             except Exception as e:
                 logger.error(f"Text input error: {e}", exc_info=True)
-                await self.protocol.send_error(f"Processing error: {str(e)}")
+                await self.protocol.send_error("internal error")
                 if self._current_resp_id:
-                    await self.protocol.send_response_done(self._current_resp_id)
+                    await self.protocol.send_response_done(self._current_resp_id, status="failed")
                     self._current_resp_id = None
         finally:
             if self._active_pipeline_task is my_task:
@@ -1300,7 +1345,7 @@ class RealtimeSession:
             self._active_pipeline_task = None
         
         if self._current_resp_id:
-            await self.protocol.send_response_done(self._current_resp_id)
+            await self.protocol.send_response_done(self._current_resp_id, status="cancelled")
             self._current_resp_id = None
         
         self._is_responding = False

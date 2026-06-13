@@ -22,6 +22,7 @@ import numpy as np
 from typing import AsyncIterator
 
 from .tts_pipeline import SentenceSplitter
+from ._ref_audio_safety import RefAudioConfig, resolve_local_ref, validate_remote_url, ref_audio_config_from_app_config
 
 logger = logging.getLogger("realtime-server")
 
@@ -48,10 +49,19 @@ class GsvTtsPipeline:
         sample_rate_out: int = 24000,
         timeout_s: int = 30,
         speed: float = 1.0,
+        app_config: object | None = None,
     ):
         self.base_url = base_url.rstrip("/")
-        self.speaker_audio = speaker_audio
-        self.prompt_audio = prompt_audio
+
+        # Safety config for audio path resolution
+        if app_config is not None:
+            self._ref_audio_cfg = ref_audio_config_from_app_config(app_config)
+        else:
+            self._ref_audio_cfg = RefAudioConfig()
+
+        # Validate and resolve speaker_audio / prompt_audio safely
+        self.speaker_audio = self._validate_audio_ref(speaker_audio, "speaker_audio")
+        self.prompt_audio = self._validate_audio_ref(prompt_audio, "prompt_audio")
         self.prompt_text = prompt_text
         self.sample_rate_out = sample_rate_out
         self.gsv_sample_rate = 32000  # GSV-TTS-Lite fixed output 32kHz
@@ -61,6 +71,48 @@ class GsvTtsPipeline:
 
         # Pre-compute resample ratio
         self._resample_ratio = self.gsv_sample_rate / self.sample_rate_out
+
+    def _validate_audio_ref(self, ref: str, param_name: str) -> str:
+        """Validate a speaker_audio / prompt_audio reference safely.
+
+        For local paths: validates against path-traversal rules.
+        For HTTP(S) URLs: validates against SSRF rules.
+        For data: URLs: passes through.
+        Empty string: passes through (GSV allows empty).
+
+        Returns the validated reference string (unchanged for URLs/data, or
+        the original path string if local validation passed).
+        """
+        if not ref:
+            return ref
+
+        # data: URLs are inline — no I/O risk
+        if ref.startswith("data:"):
+            return ref
+
+        # HTTP(S) URL — validate against SSRF rules
+        if "://" in ref and ref.startswith(("http://", "https://")):
+            try:
+                validate_remote_url(ref, self._ref_audio_cfg)
+            except ValueError as e:
+                logger.error(f"{param_name} URL rejected: {e}")
+                raise
+            return ref
+
+        # Any other scheme is rejected
+        if "://" in ref:
+            raise ValueError(
+                f"{param_name} URL scheme rejected (only http/https/data allowed): {ref}"
+            )
+
+        # Local file path — validate against traversal rules
+        try:
+            resolve_local_ref(ref, self._ref_audio_cfg)
+        except ValueError as e:
+            logger.error(f"{param_name} local path rejected: {e}")
+            raise
+
+        return ref
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:

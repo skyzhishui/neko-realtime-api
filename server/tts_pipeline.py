@@ -6,7 +6,10 @@ import time
 import json
 import base64
 import logging
+from pathlib import Path
 from typing import AsyncIterator
+
+from ._ref_audio_safety import RefAudioConfig, read_ref_audio_safely, ref_audio_config_from_app_config
 
 
 logger = logging.getLogger("realtime-server")
@@ -55,6 +58,7 @@ class TTSPipeline:
         api_key: str | None = None,
         ref_audio: str | None = None,
         ref_text: str | None = None,
+        app_config: object | None = None,
     ):
         self.base_url = base_url
         self.voice = voice
@@ -63,6 +67,12 @@ class TTSPipeline:
         self.timeout_s = timeout_s
         self.api_key = api_key
         self._session: aiohttp.ClientSession | None = None
+
+        # Safety config for ref_audio resolution
+        if app_config is not None:
+            self._ref_audio_cfg = ref_audio_config_from_app_config(app_config)
+        else:
+            self._ref_audio_cfg = RefAudioConfig()
 
         # Voice cloning (ref_audio/ref_text)
         self.ref_audio = self._resolve_ref_audio(ref_audio)
@@ -80,43 +90,57 @@ class TTSPipeline:
         stripped = TTSPipeline.PUNCTUATION_WHITESPACE_RE.sub("", text)
         return len(stripped) == 0
 
-    @staticmethod
-    def _resolve_ref_audio(ref_audio: str | None) -> str | None:
+    def _resolve_ref_audio(self, ref_audio: str | None) -> str | None:
         """Resolve ref_audio to a format suitable for the API.
 
         If ref_audio is a local file path (no scheme like http://, https://, data:, file://),
-        read the file and convert to a base64 data URL.
-        Otherwise, return as-is (already an HTTP URL, data URL, or file:// URI).
+        read the file safely (path-traversal guard) and convert to a base64 data URL.
+        If ref_audio is an HTTP(S) URL, validate against SSRF rules before returning as-is.
+        If ref_audio is a data: URL, return as-is.
         """
         if ref_audio is None:
             return None
 
-        # If it already has a scheme, return as-is
+        # data: URLs are inline — no I/O risk, pass through
+        if ref_audio.startswith("data:"):
+            return ref_audio
+
+        # HTTP(S) URL — validate against SSRF rules
+        if "://" in ref_audio and ref_audio.startswith(("http://", "https://")):
+            from ._ref_audio_safety import validate_remote_url
+            try:
+                validate_remote_url(ref_audio, self._ref_audio_cfg)
+            except ValueError as e:
+                logger.error(f"ref_audio URL rejected: {e}")
+                raise
+            return ref_audio
+
+        # Any other scheme (file://, ftp://, etc.) is rejected
         if "://" in ref_audio:
-            return ref_audio
+            raise ValueError(
+                f"ref_audio URL scheme rejected (only http/https/data allowed): {ref_audio}"
+            )
 
-        # Treat as a local file path
-        from pathlib import Path
-        path = Path(ref_audio)
-        if not path.exists():
-            logger.warning(f"ref_audio file not found: {ref_audio}, using as-is")
-            return ref_audio
-
+        # Local file path — resolve safely
         try:
-            audio_bytes = path.read_bytes()
-            b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            suffix = path.suffix.lower().lstrip(".")
-            mime_map = {
-                "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
-                "ogg": "audio/ogg", "aac": "audio/aac", "pcm": "audio/pcm",
-            }
-            mime_type = mime_map.get(suffix, "audio/wav")
-            data_url = f"data:{mime_type};base64,{b64}"
-            logger.info(f"ref_audio: loaded local file {ref_audio} ({len(audio_bytes)} bytes) -> base64 data URL")
-            return data_url
+            audio_bytes = read_ref_audio_safely(ref_audio, self._ref_audio_cfg)
+        except (ValueError, FileNotFoundError) as e:
+            logger.error(f"ref_audio local file rejected: {e}")
+            raise
         except Exception as e:
             logger.error(f"Failed to read ref_audio file {ref_audio}: {e}")
-            return ref_audio
+            raise
+
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        suffix = Path(ref_audio).suffix.lower().lstrip(".")
+        mime_map = {
+            "wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+            "ogg": "audio/ogg", "aac": "audio/aac", "pcm": "audio/pcm",
+        }
+        mime_type = mime_map.get(suffix, "audio/wav")
+        data_url = f"data:{mime_type};base64,{b64}"
+        logger.info(f"ref_audio: loaded local file {ref_audio} ({len(audio_bytes)} bytes) -> base64 data URL")
+        return data_url
 
     async def stream_tts(
         self,

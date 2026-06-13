@@ -1,7 +1,9 @@
 """WebSocket Server for LocalOmniRealtimeServer."""
 import asyncio
+import hmac
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
@@ -58,13 +60,51 @@ async def realtime_endpoint(
 ):
     """WebSocket endpoint for Realtime API."""
     config = ServerConfig.load()
-    
-    # Optional authentication
-    if config.auth_enabled:
+
+    # P0-fix (Oracle blocker #2): unified auth source.
+    # Prefer security.* (new canonical location) over realtime_server.* (legacy).
+    # Default to True when neither is set — secure-by-default.
+    sec_auth = config.get("security", "auth_enabled", default=None)
+    legacy_auth = config.get("realtime_server", "auth_enabled", default=None)
+    if sec_auth is not None:
+        auth_enabled = bool(sec_auth)
+    elif legacy_auth is not None:
+        auth_enabled = bool(legacy_auth)
+    else:
+        auth_enabled = True
+
+    # P0-fix (Oracle blocker #4): tolerate None / non-string token (YAML null → Python None).
+    raw_token = config.get("security", "auth_token", default=None)
+    if raw_token is None or str(raw_token).strip() == "":
+        raw_token = config.get("realtime_server", "auth_token", default="")
+    auth_token = "" if raw_token is None else str(raw_token)
+
+    if auth_enabled:
+        # P0-fix (Oracle blocker #3): correct empty-allowlist semantics.
+        # security.allowed_origins == []  → allow ALL origins (matches yaml comment)
+        # security.allowed_origins == [non-empty]  → strict allowlist
+        # Server-to-server clients with no Origin header always pass this check.
+        allowed_origins = config.get("security", "allowed_origins", default=[])
+        if not isinstance(allowed_origins, list):
+            allowed_origins = []
+        origin = websocket.headers.get("origin", "")
+        if origin and len(allowed_origins) > 0:
+            # Strict allowlist: origin must match exactly
+            if origin not in allowed_origins:
+                logger.warning(f"Rejected WebSocket from disallowed origin: {origin}")
+                await websocket.close(code=4401, reason="Origin not allowed")
+                return
+        # else: empty allowlist (allow all) OR no Origin header (server-to-server) → pass
+
+        # Token validation using constant-time comparison
         auth = websocket.headers.get("authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != config.auth_token:
-            await websocket.close(code=1008, reason="Unauthorized")
-            logger.warning("Unauthorized connection attempt")
+        provided_token = auth[7:] if auth.startswith("Bearer ") else ""
+        # Both sides forced to bytes; auth_token is now guaranteed to be a str
+        if not provided_token or not auth_token or not hmac.compare_digest(
+            provided_token.encode("utf-8"), auth_token.encode("utf-8")
+        ):
+            logger.warning("Unauthorized connection attempt: missing or invalid bearer token")
+            await websocket.close(code=4401, reason="Unauthorized")
             return
     
     await websocket.accept()
@@ -74,7 +114,7 @@ async def realtime_endpoint(
     session = RealtimeSession(websocket, model, config)
 
     # Notify client that session has been created
-    await session.protocol.send_session_created()
+    await session.protocol.send_session_created(session.session_config)
 
     # Main event loop
     try:
@@ -88,8 +128,9 @@ async def realtime_endpoint(
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError as e:
-                logger.warning(f"Invalid JSON received: {e}")
-                await session.protocol.send_error(f"Invalid JSON: {str(e)}")
+                error_id = str(uuid.uuid4())[:8]
+                logger.warning(f"[{error_id}] Invalid JSON received: {e}")
+                await session.protocol.send_error(f"Invalid JSON (ref {error_id})")
                 continue
             
             await session.handle_event(event)
@@ -97,7 +138,8 @@ async def realtime_endpoint(
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
+        error_id = str(uuid.uuid4())[:8]
+        logger.error(f"[{error_id}] WebSocket error: {e}", exc_info=True)
     finally:
         await session.cleanup()
         logger.info("Session cleaned up")

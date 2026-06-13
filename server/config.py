@@ -9,10 +9,19 @@ _DEFAULT_CONFIG = {
         "host": "0.0.0.0",
         "port": 8765,
         "auth_enabled": False,
-        "auth_token": "local-no-key-needed",
-        "default_mode": "omni_audio",
+        "auth_token": "",  # Empty = must be set by user when auth_enabled is True
+        "default_mode": "asr_llm",
         "omni_error_threshold": 3,
         "fallback_duration_s": 60,
+    },
+    "security": {
+        "auth_enabled": True,
+        "auth_token": "",  # Empty = server refuses to start when auth_enabled is True
+        "allowed_origins": [],
+        "max_audio_frame_b64_bytes": 5242880,
+        "max_image_b64_bytes": 10485760,
+        "max_conversation_items": 200,
+        "max_session_audio_seconds": 600,
     },
     "vad": {
         "engine": "silero",
@@ -29,7 +38,7 @@ _DEFAULT_CONFIG = {
     },
     "services": {
         "omni": {
-            "base_url": "http://localhost:8000",
+            "base_url": "http://localhost:8000/v1",
             "model": "Qwen3-Omni",
             "api_key": None,
             "timeout_s": 30,
@@ -38,30 +47,30 @@ _DEFAULT_CONFIG = {
             "repetition_penalty": 1.2,
         },
         "asr": {
-            "base_url": "http://localhost:8082",
+            "base_url": None,
             "model": "SenseVoiceSmall",
             "language": "zh",
             "timeout_s": 10,
             "use_ws": False,
-            "local_asr": False,
-            "device": "cuda",
-            "asr_model_path": "/home/skyzhishui/models/sherpa-onnx-sense-voice-small",
+            "local_asr": True,
+            "device": "cpu",
+            "asr_model_path": "./models/sherpa-onnx-sense-voice-small",  # User must set or rely on auto-download
         },
         "tts": {
-            "base_url": "http://localhost:8091",
+            "base_url": "http://localhost:8091/v1",
             "ws_url": "ws://localhost:8091/v1/audio/speech/stream",
             "mode": "http",
-            "model": "Qwen3-TTS",       # Route key: Qwen3-TTS | voxcpm2 | gsv-tts-lite
+            "model": "Qwen3-TTS",
             "api_key": None,
-            "voice": "Vivian",
+            "voice": "vivian",
             "response_format": "pcm",
             "stream": True,
             "stream_format": "audio",
             "language": "Chinese",
             "sample_rate": 24000,
             "timeout_s": 15,
-            "ref_audio": None,      # 声音克隆：参考音频文件路径或URL（Qwen3-TTS和VoxCPM2均使用ref_audio）
-            "ref_text": None,       # 声音克隆：参考音频转录文本（Qwen3-TTS和VoxCPM2均使用ref_text）
+            "ref_audio": None,
+            "ref_text": None,
         },
         "gsv_tts": {
             "base_url": "http://localhost:8001",
@@ -73,11 +82,16 @@ _DEFAULT_CONFIG = {
             "speed": 1.0,
         },
     },
+    "tts": {
+        "ref_audio_dir": "./ref_audio",
+        "allowed_ref_audio_hosts": [],
+        "max_ref_audio_bytes": 52428800,
+    },
     "tts_pipeline": {
         "min_sub_sentence_len": 6,
         "max_concurrent_tts": 2,
-        "resample_output": True,
-        "output_sample_rate": 16000,
+        "resample_output": False,
+        "output_sample_rate": 24000,
     },
 }
 
@@ -139,11 +153,21 @@ class ServerConfig:
 
     @property
     def auth_token(self) -> str:
-        return self.get("realtime_server", "auth_token", default="local-no-key-needed")
+        return self.get("realtime_server", "auth_token", default="")
 
     @property
     def default_mode(self) -> str:
-        return self.get("realtime_server", "default_mode", default="omni_audio")
+        return self.get("realtime_server", "default_mode", default="asr_llm")
+
+    def validate_security(self) -> None:
+        """Validate security config. Raises ValueError if auth_enabled but no token set."""
+        sec_auth = self.get("security", "auth_enabled", default=True)
+        sec_token = self.get("security", "auth_token", default="")
+        if sec_auth and (sec_token is None or str(sec_token).strip() == ""):
+            raise ValueError(
+                "security.auth_token must be set when security.auth_enabled is True. "
+                "Refusing to start with empty auth token."
+            )
 
     def __repr__(self) -> str:
         return f"ServerConfig({self._data})"

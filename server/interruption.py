@@ -66,8 +66,9 @@ class InterruptionHandler:
         self._cancel_event.set()
 
         # Send response.done to client (cancelled)
+        # P0-fix (Oracle blocker #1): explicit status="cancelled" — was defaulting to "completed"
         try:
-            await protocol.send_response_done(resp_id)
+            await protocol.send_response_done(resp_id, status="cancelled")
         except Exception as e:
             logger.warning(f"[Interruption] Failed to send response.done during interruption: {e}")
 

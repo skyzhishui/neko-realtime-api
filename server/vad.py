@@ -30,6 +30,7 @@ from collections import deque
 import logging
 import time
 import os
+import threading
 
 from ._whisper_features import compute_whisper_log_mel_features
 
@@ -422,6 +423,19 @@ class SileroVADModule:
     - If Smart Turn judges "Complete" → trigger speech_stopped (user finished speaking)
     - If Smart Turn judges "Incomplete" → reset silence counter, continue waiting (user is thinking)
     - Smart Turn only runs on silence_timeout, does NOT affect real-time VAD flow
+    
+    Threading model:
+    - process() is called via loop.run_in_executor() (ThreadPoolExecutor), i.e. from a
+      worker thread.  reset() and update_silence_config() may be called from the asyncio
+      event-loop thread.  All mutable per-session state (ONNX LSTM arrays, speech
+      counters, audio buffers, Smart Turn state) is therefore subject to data races.
+    - A per-instance threading.Lock (_state_lock) serialises access to every piece of
+      mutable state.  The lock is held for the duration of process() — including the
+      ONNX inference call — because (a) Silero VAD is tiny (< 1 ms per frame on CPU),
+      (b) the frame rate is only ~50 ms, and (c) splitting the lock around the
+      state-read / inference / state-write boundary would still require holding the lock
+      across the write-back, offering no real concurrency benefit while risking
+      inconsistent state if a reset() sneaks in between read and write.
     """
     
     CHUNK_SIZE = 512  # 32ms @ 16kHz, Silero VAD minimum processing unit
@@ -477,6 +491,12 @@ class SileroVADModule:
         
         # smart_turn 模型下载在 SmartTurnDetector 初始化时处理
         self._smart_turn_model_dir = smart_turn_dir
+        
+        # ---- Thread-safety lock ----
+        # Guards all mutable per-session state: ONNX LSTM arrays (_state, _context),
+        # speech detection counters, audio buffers, and Smart Turn state.
+        # See class docstring for the threading model rationale.
+        self._state_lock = threading.Lock()
         
         # ---- VAD 后端状态 ----
         self._onnx_session = None   # ONNX InferenceSession
@@ -615,6 +635,9 @@ class SileroVADModule:
         # ---- Model directory (for logging) ----
         instance._silero_model_dir = silero_model_dir
         instance._smart_turn_model_dir = None  # Not needed for preloaded
+        
+        # ---- Thread-safety lock ----
+        instance._state_lock = threading.Lock()
         
         # ---- Shared model artifacts ----
         instance._onnx_session = onnx_session
@@ -826,7 +849,8 @@ class SileroVADModule:
     @silence_timeout_ms.setter
     def silence_timeout_ms(self, value: int):
         """Alias for silence_duration_ms (unified parameter, see M3)."""
-        self.silence_duration_ms = value
+        with self._state_lock:
+            self.silence_duration_ms = value
 
     def update_silence_config(self, silence_ms: int):
         """Update silence detection configuration (called by session.update).
@@ -836,43 +860,45 @@ class SileroVADModule:
         - silence_timeout_ms: same as silence_duration_ms (unified parameter, see M3)
         - _silence_timeout_frames: calculated from silence_duration_ms
         """
-        self.silence_duration_ms = silence_ms
-        # silence_timeout_ms is now an alias for silence_duration_ms (see M3 property)
-        self._silence_timeout_frames = int(
-            silence_ms / (self.CHUNK_SIZE / self.sample_rate * 1000)
-        )
+        with self._state_lock:
+            self.silence_duration_ms = silence_ms
+            # silence_timeout_ms is now an alias for silence_duration_ms (see M3 property)
+            self._silence_timeout_frames = int(
+                silence_ms / (self.CHUNK_SIZE / self.sample_rate * 1000)
+            )
 
     def reset(self):
         """Reset VAD state."""
-        self.is_speaking = False
-        self.prefix_chunks.clear()
-        self._sample_chunks.clear()
-        
-        # min_speech_duration 状态重置
-        self._speech_candidate_frames = 0
-        self._speech_confirmed = False
-        
-        # max_audio_duration 状态重置
-        self._total_speech_frames = 0
-        
-        # silence_timeout 状态重置
-        self._silence_timeout_count = 0
-        
-        # Smart Turn 音频缓冲重置
-        self._turn_audio_chunks = []
-        self._consecutive_incomplete_count = 0
-        
-        # ONNX 状态重置
-        self._state = np.zeros((2, 1, 128), dtype=np.float32)
-        self._context = np.zeros((1, self._context_size), dtype=np.float32)
-        
-        
-        # VAD 埋点状态重置（保留 _frame_count 以维持周期性输出的连续性）
-        self._prob_window.clear()
-        self._speech_frame_count_in_window = 0
-        self._speech_start_time = None
-        self._speech_start_prob = 0.0
-        self._last_silence_start_time = None
+        with self._state_lock:
+            self.is_speaking = False
+            self.prefix_chunks.clear()
+            self._sample_chunks.clear()
+            
+            # min_speech_duration 状态重置
+            self._speech_candidate_frames = 0
+            self._speech_confirmed = False
+            
+            # max_audio_duration 状态重置
+            self._total_speech_frames = 0
+            
+            # silence_timeout 状态重置
+            self._silence_timeout_count = 0
+            
+            # Smart Turn 音频缓冲重置
+            self._turn_audio_chunks = []
+            self._consecutive_incomplete_count = 0
+            
+            # ONNX 状态重置
+            self._state = np.zeros((2, 1, 128), dtype=np.float32)
+            self._context = np.zeros((1, self._context_size), dtype=np.float32)
+            
+            
+            # VAD 埋点状态重置（保留 _frame_count 以维持周期性输出的连续性）
+            self._prob_window.clear()
+            self._speech_frame_count_in_window = 0
+            self._speech_start_time = None
+            self._speech_start_prob = 0.0
+            self._last_silence_start_time = None
     
     def _detect_frame(self, chunk: np.ndarray) -> float:
         """Detect VAD for a single CHUNK_SIZE frame.
@@ -1033,6 +1059,15 @@ class SileroVADModule:
              - Complete → 触发 speech_stopped
              - Incomplete → 重置静音计数，继续等待
         3. max_audio_duration: 累积音频超过最大时长强制截断
+        
+        Thread safety:
+        The entire body (after early-return checks) is guarded by _state_lock.
+        This includes the ONNX inference call.  Silero VAD inference is very fast
+        (< 1 ms on CPU for a 512-sample frame), and frames arrive every ~50 ms,
+        so holding the lock across inference does not create a bottleneck.  Locking
+        at a finer granularity (e.g. only around state read/write but not inference)
+        would risk a reset() interleaving between state-read and state-write-back,
+        producing inconsistent LSTM state.
         """
         if len(pcm16_bytes) < 2:
             return []
@@ -1043,101 +1078,129 @@ class SileroVADModule:
         
         audio_np = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
-        # Append to chunk buffer (O(1))
-        self._sample_chunks.append(audio_np)
-        
-        events = []
-        frame_ms = self.CHUNK_SIZE / self.sample_rate * 1000  # 32ms per frame
-        
-        # Process complete chunks from buffer
-        while True:
-            total = sum(len(c) for c in self._sample_chunks)
-            if total < self.CHUNK_SIZE:
-                break
-            collected = []
-            avail = 0
-            while self._sample_chunks and avail < self.CHUNK_SIZE:
-                c = self._sample_chunks.popleft()
-                collected.append(c)
-                avail += len(c)
-            flat = np.concatenate(collected) if len(collected) > 1 else collected[0]
-            chunk = flat[:self.CHUNK_SIZE]
-            remainder = flat[self.CHUNK_SIZE:]
-            if len(remainder) > 0:
-                self._sample_chunks.appendleft(remainder)
+        with self._state_lock:
+            # Append to chunk buffer (O(1))
+            self._sample_chunks.append(audio_np)
             
-            # VAD 检测
-            speech_prob = self._detect_frame(chunk)
+            events = []
+            frame_ms = self.CHUNK_SIZE / self.sample_rate * 1000  # 32ms per frame
             
-            # 更新 prob 统计（用于周期性输出）
-            self._update_prob_stats(speech_prob)
-            
-            # ---- 状态机逻辑 ----
-            
-            if not self.is_speaking:
-                # === 未说话状态 ===
-                self.prefix_chunks.append(chunk.copy())
+            # Process complete chunks from buffer
+            while True:
+                total = sum(len(c) for c in self._sample_chunks)
+                if total < self.CHUNK_SIZE:
+                    break
+                collected = []
+                avail = 0
+                while self._sample_chunks and avail < self.CHUNK_SIZE:
+                    c = self._sample_chunks.popleft()
+                    collected.append(c)
+                    avail += len(c)
+                flat = np.concatenate(collected) if len(collected) > 1 else collected[0]
+                chunk = flat[:self.CHUNK_SIZE]
+                remainder = flat[self.CHUNK_SIZE:]
+                if len(remainder) > 0:
+                    self._sample_chunks.appendleft(remainder)
                 
-                if speech_prob >= self.threshold:
-                    # 检测到可能的语音开始
-                    self._speech_candidate_frames += 1
+                # VAD 检测
+                speech_prob = self._detect_frame(chunk)
+                
+                # 更新 prob 统计（用于周期性输出）
+                self._update_prob_stats(speech_prob)
+                
+                # ---- 状态机逻辑 ----
+                
+                if not self.is_speaking:
+                    # === 未说话状态 ===
+                    self.prefix_chunks.append(chunk.copy())
                     
-                    if not self._speech_confirmed and self._speech_candidate_frames >= self._min_speech_frames:
-                        # 语音持续超过 min_speech_duration，确认说话开始
-                        self._speech_confirmed = True
-                        self.is_speaking = True
-                        self._total_speech_frames = self._speech_candidate_frames
-                        self._silence_timeout_count = 0
+                    if speech_prob >= self.threshold:
+                        # 检测到可能的语音开始
+                        self._speech_candidate_frames += 1
                         
-                        # Smart Turn: 开始累积语音期音频（包含 prefix 中的候选帧）
-                        if self.smart_turn_enabled and self._smart_turn is not None:
-                            prefix_np = np.concatenate(list(self.prefix_chunks))
-                            self._turn_audio_chunks = [prefix_np.copy()]
-                        
-                        # 埋点: speech_started
-                        self._speech_start_time = time.monotonic()
-                        self._speech_start_prob = speech_prob
-                        accumulated_ms = self._speech_candidate_frames * frame_ms
-                        logger.info(
-                            f"[VAD] speech_started: prob={speech_prob:.4f}, "
-                            f"accumulated_audio={accumulated_ms:.0f}ms "
-                            f"({self._speech_candidate_frames} frames), "
-                            f"threshold={self.threshold}"
-                        )
-                        
-                        events.append("speech_started")
+                        if not self._speech_confirmed and self._speech_candidate_frames >= self._min_speech_frames:
+                            # 语音持续超过 min_speech_duration，确认说话开始
+                            self._speech_confirmed = True
+                            self.is_speaking = True
+                            self._total_speech_frames = self._speech_candidate_frames
+                            self._silence_timeout_count = 0
+                            
+                            # Smart Turn: 开始累积语音期音频（包含 prefix 中的候选帧）
+                            if self.smart_turn_enabled and self._smart_turn is not None:
+                                prefix_np = np.concatenate(list(self.prefix_chunks))
+                                self._turn_audio_chunks = [prefix_np.copy()]
+                            
+                            # 埋点: speech_started
+                            self._speech_start_time = time.monotonic()
+                            self._speech_start_prob = speech_prob
+                            accumulated_ms = self._speech_candidate_frames * frame_ms
+                            logger.info(
+                                f"[VAD] speech_started: prob={speech_prob:.4f}, "
+                                f"accumulated_audio={accumulated_ms:.0f}ms "
+                                f"({self._speech_candidate_frames} frames), "
+                                f"threshold={self.threshold}"
+                            )
+                            
+                            events.append("speech_started")
+                    else:
+                        # 语音概率低于阈值，重置候选帧
+                        self._speech_candidate_frames = 0
+                        self._speech_confirmed = False
+                
                 else:
-                    # 语音概率低于阈值，重置候选帧
-                    self._speech_candidate_frames = 0
-                    self._speech_confirmed = False
-            
-            else:
-                # === 说话中状态 ===
-                self._total_speech_frames += 1
-                
-                # Smart Turn: 累积语音期音频（所有帧，包括静音帧，保持连续性）
-                if self.smart_turn_enabled and self._smart_turn is not None:
-                    self._turn_audio_chunks.append(chunk)
-                
-                if speech_prob >= self.threshold:
-                    # 仍在说话
-                    self._silence_timeout_count = 0
-                    self._last_silence_start_time = None
-                else:
-                    # 检测到静音
-                    if self._last_silence_start_time is None:
-                        self._last_silence_start_time = time.monotonic()
-                    self._silence_timeout_count += 1
-                
-                # 检查 silence_timeout: 说话后持续静音超时 → Smart Turn 二次判断
-                if self._silence_timeout_count >= self._silence_timeout_frames:
+                    # === 说话中状态 ===
+                    self._total_speech_frames += 1
                     
+                    # Smart Turn: 累积语音期音频（所有帧，包括静音帧，保持连续性）
                     if self.smart_turn_enabled and self._smart_turn is not None:
-                        # Smart Turn 二次判断
-                        is_complete = self._check_smart_turn()
+                        self._turn_audio_chunks.append(chunk)
+                    
+                    if speech_prob >= self.threshold:
+                        # 仍在说话
+                        self._silence_timeout_count = 0
+                        self._last_silence_start_time = None
+                    else:
+                        # 检测到静音
+                        if self._last_silence_start_time is None:
+                            self._last_silence_start_time = time.monotonic()
+                        self._silence_timeout_count += 1
+                    
+                    # 检查 silence_timeout: 说话后持续静音超时 → Smart Turn 二次判断
+                    if self._silence_timeout_count >= self._silence_timeout_frames:
                         
-                        if is_complete:
-                            # Complete: 用户说完了 → 触发 speech_stopped
+                        if self.smart_turn_enabled and self._smart_turn is not None:
+                            # Smart Turn 二次判断
+                            is_complete = self._check_smart_turn()
+                            
+                            if is_complete:
+                                # Complete: 用户说完了 → 触发 speech_stopped
+                                silence_duration_ms = self._silence_timeout_count * frame_ms
+                                total_speech_ms = self._total_speech_frames * frame_ms
+                                logger.info(
+                                    f"[VAD] speech_stopped: silence_duration={silence_duration_ms:.0f}ms "
+                                    f"({self._silence_timeout_count} frames), "
+                                    f"total_speech={total_speech_ms:.0f}ms "
+                                    f"({self._total_speech_frames} frames), "
+                                    f"reason=silence_timeout+smart_turn_complete"
+                                )
+                                
+                                self.is_speaking = False
+                                self._speech_candidate_frames = 0
+                                self._speech_confirmed = False
+                                self._total_speech_frames = 0
+                                self._silence_timeout_count = 0
+                                self._speech_start_time = None
+                                self._last_silence_start_time = None
+                                self._turn_audio_chunks = []
+                                events.append("speech_stopped")
+                            else:
+                                # Incomplete: 用户还在思考 → 重置静音计数，继续等待
+                                self._silence_timeout_count = 0
+                                self._last_silence_start_time = None
+                                # 注意: 不重置 _turn_audio_chunks，继续累积
+                                # 注意: 不触发任何事件
+                        else:
+                            # Smart Turn 未启用，直接触发 speech_stopped（原始逻辑）
                             silence_duration_ms = self._silence_timeout_count * frame_ms
                             total_speech_ms = self._total_speech_frames * frame_ms
                             logger.info(
@@ -1145,7 +1208,7 @@ class SileroVADModule:
                                 f"({self._silence_timeout_count} frames), "
                                 f"total_speech={total_speech_ms:.0f}ms "
                                 f"({self._total_speech_frames} frames), "
-                                f"reason=silence_timeout+smart_turn_complete"
+                                f"reason=silence_timeout"
                             )
                             
                             self.is_speaking = False
@@ -1155,24 +1218,17 @@ class SileroVADModule:
                             self._silence_timeout_count = 0
                             self._speech_start_time = None
                             self._last_silence_start_time = None
-                            self._turn_audio_chunks = []
                             events.append("speech_stopped")
-                        else:
-                            # Incomplete: 用户还在思考 → 重置静音计数，继续等待
-                            self._silence_timeout_count = 0
-                            self._last_silence_start_time = None
-                            # 注意: 不重置 _turn_audio_chunks，继续累积
-                            # 注意: 不触发任何事件
-                    else:
-                        # Smart Turn 未启用，直接触发 speech_stopped（原始逻辑）
-                        silence_duration_ms = self._silence_timeout_count * frame_ms
+                    
+                    # 检查 max_audio_duration: 累积音频超过最大时长 → 强制截断
+                    elif self._total_speech_frames >= self._max_audio_frames:
+                        # 埋点: max_duration_reached
                         total_speech_ms = self._total_speech_frames * frame_ms
                         logger.info(
-                            f"[VAD] speech_stopped: silence_duration={silence_duration_ms:.0f}ms "
-                            f"({self._silence_timeout_count} frames), "
-                            f"total_speech={total_speech_ms:.0f}ms "
+                            f"[VAD] max_duration_reached: "
+                            f"accumulated_audio={total_speech_ms:.0f}ms "
                             f"({self._total_speech_frames} frames), "
-                            f"reason=silence_timeout"
+                            f"max_limit={self.max_audio_duration_ms}ms"
                         )
                         
                         self.is_speaking = False
@@ -1182,38 +1238,19 @@ class SileroVADModule:
                         self._silence_timeout_count = 0
                         self._speech_start_time = None
                         self._last_silence_start_time = None
+                        self._turn_audio_chunks = []
+                        self._consecutive_incomplete_count = 0
                         events.append("speech_stopped")
-                
-                # 检查 max_audio_duration: 累积音频超过最大时长 → 强制截断
-                elif self._total_speech_frames >= self._max_audio_frames:
-                    # 埋点: max_duration_reached
-                    total_speech_ms = self._total_speech_frames * frame_ms
-                    logger.info(
-                        f"[VAD] max_duration_reached: "
-                        f"accumulated_audio={total_speech_ms:.0f}ms "
-                        f"({self._total_speech_frames} frames), "
-                        f"max_limit={self.max_audio_duration_ms}ms"
-                    )
-                    
-                    self.is_speaking = False
-                    self._speech_candidate_frames = 0
-                    self._speech_confirmed = False
-                    self._total_speech_frames = 0
-                    self._silence_timeout_count = 0
-                    self._speech_start_time = None
-                    self._last_silence_start_time = None
-                    self._turn_audio_chunks = []
-                    self._consecutive_incomplete_count = 0
-                    events.append("speech_stopped")
-                    events.append("max_duration_reached")
-        
-        return events
+                        events.append("max_duration_reached")
+            
+            return events
     
     def get_prefix_audio(self) -> bytes:
         """Get prefix audio as PCM16 bytes (audio before speech started)."""
-        if not self.prefix_chunks:
-            return b""
-        prefix_np = np.concatenate(list(self.prefix_chunks))
+        with self._state_lock:
+            if not self.prefix_chunks:
+                return b""
+            prefix_np = np.concatenate(list(self.prefix_chunks))
         return (prefix_np * 32768.0).astype(np.int16).tobytes()
     
     def get_turn_audio(self) -> bytes:
@@ -1226,9 +1263,10 @@ class SileroVADModule:
         Returns:
             PCM16 bytes of the current speech turn, or empty bytes if no speech.
         """
-        if not self._turn_audio_chunks:
-            return b""
-        turn_audio = np.concatenate(self._turn_audio_chunks)
+        with self._state_lock:
+            if not self._turn_audio_chunks:
+                return b""
+            turn_audio = np.concatenate(self._turn_audio_chunks)
         return (turn_audio * 32768.0).astype(np.int16).tobytes()
 
     @property

@@ -31,6 +31,7 @@ from typing import AsyncIterator
 import websockets
 
 from .tts_pipeline import SentenceSplitter
+from ._ref_audio_safety import RefAudioConfig, read_ref_audio_safely, ref_audio_config_from_app_config
 
 logger = logging.getLogger("realtime-server")
 
@@ -55,6 +56,7 @@ class VoxCpm2TtsPipeline:
         api_key: str = "",
         ref_audio: str | None = None,
         ref_text: str | None = None,
+        app_config: object | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.voice = voice
@@ -63,54 +65,75 @@ class VoxCpm2TtsPipeline:
         self.voxcpm_sample_rate = 48000  # VoxCPM2 fixed output 48kHz
         self._session: aiohttp.ClientSession | None = None
 
+        # Safety config for ref_audio resolution
+        if app_config is not None:
+            self._ref_audio_cfg = ref_audio_config_from_app_config(app_config)
+        else:
+            self._ref_audio_cfg = RefAudioConfig()
+
         # Voice cloning parameters
         # If ref_audio is a local file path, read it and convert to base64 data URL
         self.ref_audio = self._resolve_ref_audio(ref_audio)
         self.ref_text = ref_text
 
-    @staticmethod
-    def _resolve_ref_audio(ref_audio: str | None) -> str | None:
+    def _resolve_ref_audio(self, ref_audio: str | None) -> str | None:
         """Resolve ref_audio to a format suitable for the API.
 
         If ref_audio is a local file path (no scheme like http://, https://, data:, file://),
-        read the file and convert to a base64 data URL.
-        Otherwise, return as-is (already an HTTP URL, data URL, or file:// URI).
+        read the file safely (path-traversal guard) and convert to a base64 data URL.
+        If ref_audio is an HTTP(S) URL, validate against SSRF rules before returning as-is.
+        If ref_audio is a data: URL, return as-is.
         """
         if ref_audio is None:
             return None
 
-        # If it already has a scheme, return as-is
+        # data: URLs are inline — no I/O risk, pass through
+        if ref_audio.startswith("data:"):
+            return ref_audio
+
+        # HTTP(S) URL — validate against SSRF rules
+        if "://" in ref_audio and ref_audio.startswith(("http://", "https://")):
+            from ._ref_audio_safety import validate_remote_url
+            try:
+                validate_remote_url(ref_audio, self._ref_audio_cfg)
+            except ValueError as e:
+                logger.error(f"ref_audio URL rejected: {e}")
+                raise
+            return ref_audio
+
+        # Any other scheme (file://, ftp://, etc.) is rejected
         if "://" in ref_audio:
-            return ref_audio
+            raise ValueError(
+                f"ref_audio URL scheme rejected (only http/https/data allowed): {ref_audio}"
+            )
 
-        # Treat as a local file path — read and encode as base64 data URL
-        path = Path(ref_audio)
-        if not path.exists():
-            logger.warning(f"ref_audio file not found: {ref_audio}, using as-is")
-            return ref_audio
-
+        # Local file path — resolve safely
         try:
-            audio_bytes = path.read_bytes()
-            b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            # Guess MIME type from extension
-            suffix = path.suffix.lower().lstrip(".")
-            mime_map = {
-                "wav": "audio/wav",
-                "mp3": "audio/mpeg",
-                "flac": "audio/flac",
-                "ogg": "audio/ogg",
-                "aac": "audio/aac",
-                "webm": "audio/webm",
-                "mp4": "audio/mp4",
-                "m4a": "audio/mp4",
-            }
-            mime_type = mime_map.get(suffix, "audio/wav")
-            data_url = f"data:{mime_type};base64,{b64}"
-            logger.info(f"ref_audio: loaded local file {ref_audio} ({len(audio_bytes)} bytes) -> base64 data URL")
-            return data_url
+            audio_bytes = read_ref_audio_safely(ref_audio, self._ref_audio_cfg)
+        except (ValueError, FileNotFoundError) as e:
+            logger.error(f"ref_audio local file rejected: {e}")
+            raise
         except Exception as e:
             logger.error(f"Failed to read ref_audio file {ref_audio}: {e}")
-            return ref_audio
+            raise
+
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        # Guess MIME type from extension
+        suffix = Path(ref_audio).suffix.lower().lstrip(".")
+        mime_map = {
+            "wav": "audio/wav",
+            "mp3": "audio/mpeg",
+            "flac": "audio/flac",
+            "ogg": "audio/ogg",
+            "aac": "audio/aac",
+            "webm": "audio/webm",
+            "mp4": "audio/mp4",
+            "m4a": "audio/mp4",
+        }
+        mime_type = mime_map.get(suffix, "audio/wav")
+        data_url = f"data:{mime_type};base64,{b64}"
+        logger.info(f"ref_audio: loaded local file {ref_audio} ({len(audio_bytes)} bytes) -> base64 data URL")
+        return data_url
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session with connection pooling."""
@@ -261,6 +284,7 @@ class VoxCpm2TtsWsPipeline:
         api_key: str | None = None,
         ref_audio: str | None = None,
         ref_text: str | None = None,
+        app_config: object | None = None,
     ):
         self.ws_url = ws_url
         self.voice = voice
@@ -268,8 +292,14 @@ class VoxCpm2TtsWsPipeline:
         self.timeout_s = timeout_s
         self.api_key = api_key
 
+        # Safety config for ref_audio resolution
+        if app_config is not None:
+            self._ref_audio_cfg = ref_audio_config_from_app_config(app_config)
+        else:
+            self._ref_audio_cfg = RefAudioConfig()
+
         # Voice cloning — resolve local file paths to base64 data URLs
-        self.ref_audio = VoxCpm2TtsPipeline._resolve_ref_audio(ref_audio)
+        self.ref_audio = self._resolve_ref_audio(ref_audio)
         self.ref_text = ref_text
 
         self._ws = None
@@ -280,6 +310,13 @@ class VoxCpm2TtsWsPipeline:
         self._error: str | None = None
         self._receive_task: asyncio.Task | None = None
         self._total_sentences = 0
+
+    def _resolve_ref_audio(self, ref_audio: str | None) -> str | None:
+        """Resolve ref_audio safely (delegates to VoxCpm2TtsPipeline logic)."""
+        # Reuse the same safe resolution logic as the HTTP pipeline
+        pipeline = VoxCpm2TtsPipeline.__new__(VoxCpm2TtsPipeline)
+        pipeline._ref_audio_cfg = self._ref_audio_cfg
+        return pipeline._resolve_ref_audio(ref_audio)
 
     async def connect(self):
         """Establish WebSocket connection and send session.config.

@@ -101,14 +101,14 @@ class LocalASREngine:
                 model_q8.onnx (or model.onnx) and tokens.txt. If the directory
                 exists but lacks required files, they will be automatically
                 downloaded from ModelScope (xiaowangge/sherpa-onnx-sense-voice-small).
-                Defaults to /home/skyzhishui/models/sherpa-onnx-sense-voice-small.
+                Defaults to ./models/sherpa-onnx-sense-voice-small (config-driven).
             device: Device for model inference. "cpu" or "cuda".
                 Note: "cuda" requires sherpa-onnx compiled with GPU support.
                 Default "cpu".
         """
         import sherpa_onnx
 
-        _DEFAULT_MODEL_PATH = "/home/skyzhishui/models/sherpa-onnx-sense-voice-small"
+        _DEFAULT_MODEL_PATH = "./models/sherpa-onnx-sense-voice-small"  # User must set or rely on auto-download
 
         if model_path is None:
             model_dir = _DEFAULT_MODEL_PATH

@@ -30,10 +30,18 @@ def main():
     # Load config
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
     config = ServerConfig.load(config_path)
-    
+
+    # P0-fix (Oracle blocker #2): refuse to start if security.auth_enabled=true with empty token
+    try:
+        config.validate_security()
+    except ValueError as e:
+        logger.error(f"Security config invalid: {e}")
+        sys.exit(2)
+
     logger.info(f"Starting LocalOmniRealtimeServer on {config.host}:{config.port}")
     logger.info(f"Default mode: {config.default_mode}")
-    logger.info(f"Auth enabled: {config.auth_enabled}")
+    sec_auth = config.get("security", "auth_enabled", default=True)
+    logger.info(f"Auth enabled (effective): {sec_auth}")
     
     # Run server
     uvicorn.run(

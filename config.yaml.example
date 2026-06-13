@@ -15,16 +15,19 @@ realtime_server:
   # 服务监听端口
   port: 8765
 
-  # 是否启用认证，启用后客户端连接需携带 Bearer Token
+  # 是否启用认证（旧字段，建议使用 security.auth_enabled）
+  # 启用后客户端连接需携带 Bearer Token
   auth_enabled: false
 
-  # 认证令牌，当 auth_enabled=true 时生效
+  # 认证令牌（旧字段，建议使用 security.auth_token）
+  # 当 auth_enabled=true 时生效
   # 客户端需在 WebSocket 连接时通过 Authorization 头传入
-  auth_token: local-no-key-needed
+  # 留空表示必须通过 security.auth_token 设置
+  auth_token: ""
 
   # 默认工作模式
+  # - asr_llm:    A模式（ASR+LLM模式），先 ASR 转文字再送 LLM，兼容性更好
   # - omni_audio: B模式（全双工模式），音频直接送入 Omni 模型，延迟更低
-  # - asr_llm:    A模式（ASR+LLM模式），先 ASR 转文字再送 LLM，作为降级备选
   default_mode: asr_llm
 
   # Omni 连续错误次数阈值，超过后自动降级到 A模式
@@ -33,6 +36,36 @@ realtime_server:
 
   # 降级持续时间（秒），A模式降级后经过此时间会尝试恢复 B模式
   fallback_duration_s: 60
+
+# ------------------------------------------------------------
+# 安全配置
+# ------------------------------------------------------------
+security:
+  # 是否启用认证，启用后客户端连接需携带 Bearer Token
+  # 当 auth_enabled=true 且 auth_token 为空时，服务拒绝启动
+  auth_enabled: true
+
+  # 认证令牌，当 auth_enabled=true 时生效
+  # 客户端需在 WebSocket 连接时通过 Authorization: Bearer <auth_token> 头传入
+  # ⚠️ 必须设置为非空字符串，否则服务拒绝启动
+  auth_token: ""
+
+  # 允许的跨域来源列表（CORS）
+  # 空列表表示允许所有来源
+  # 示例: ["https://example.com", "https://app.example.com"]
+  allowed_origins: []
+
+  # 单个音频帧 base64 编码后的最大字节数（5MB）
+  max_audio_frame_b64_bytes: 5242880
+
+  # 单个图片 base64 编码后的最大字节数（10MB）
+  max_image_b64_bytes: 10485760
+
+  # 单个会话最大对话条目数
+  max_conversation_items: 200
+
+  # 单个会话最大音频时长（秒）
+  max_session_audio_seconds: 600
 
 # ------------------------------------------------------------
 # VAD（语音活动检测）配置
@@ -45,15 +78,15 @@ vad:
   # 语音检测阈值（0.0~1.0），值越高要求越严格
   # - 较低值（0.3~0.5）: 更灵敏，容易误触发，适合安静环境
   # - 较高值（0.6~0.8）: 更保守，减少误触发，适合嘈杂环境
-  threshold: 0.8
+  threshold: 0.5
 
   # 静音超时时间（毫秒），检测到持续静音后判定用户说完
   # - 较短值（300~400ms）: 响应更快，但可能打断思考停顿
   # - 较长值（500~700ms）: 容忍更长的思考停顿
-  silence_timeout_ms: 400
+  silence_timeout_ms: 500
 
   # 最短语音时长（毫秒），短于此时间的语音片段将被忽略（过滤噪声）
-  min_speech_duration_ms: 300
+  min_speech_duration_ms: 200
 
   # 最大音频时长（毫秒），超过后强制截断并触发处理
   # 防止用户长时间说话导致内存溢出
@@ -61,7 +94,7 @@ vad:
 
   # 前缀填充时长（毫秒），语音开始前保留的音频缓冲
   # 用于避免语音开头被截断（吞字问题）
-  prefix_padding_ms: 500
+  prefix_padding_ms: 300
 
   # 音频采样率（Hz），通常为 16000
   sample_rate: 16000
@@ -100,7 +133,7 @@ services:
     base_url: http://localhost:8000/v1
 
     # 模型名称，需与后端实际部署的模型一致
-    model: Qwen3.6-35B-A3B
+    model: Qwen3-Omni
 
     # API Key（可选），用于 OpenAI 兼容接口认证
     # 设为 null 或不设置则不发送 Authorization 头（适用于内网无认证部署）
@@ -111,10 +144,10 @@ services:
     timeout_s: 30
 
     # 最大生成 token 数
-    max_tokens: 512
+    max_tokens: 4096
 
     # 生成温度（0.0~2.0），值越高输出越随机
-    temperature: 1
+    temperature: 0.7
 
     # 重复惩罚（>1.0 抑制重复），值越大惩罚越强
     repetition_penalty: 1.2
@@ -162,6 +195,7 @@ services:
     #   tokens.txt (词表文件)
     # 设为 null 则使用默认路径 ./models
     # 首次启动时自动从 ModelScope 下载 xiaowangge/sherpa-onnx-sense-voice-small
+    # ⚠️ 用户需根据实际部署路径修改
     asr_model_path: ./models/sherpa-onnx-sense-voice-small
 
   # ---- TTS 语音合成服务 ----
@@ -180,8 +214,8 @@ services:
     ws_url: ws://localhost:8091/v1/audio/speech/stream
 
     # TTS 调用模式
-    # - http: 分句 HTTP 模式，LLM 输出按标点分句后逐句请求 TTS ✅
-    # - ws:   WebSocket 逐字流式模式，LLM 每个 token 即时送 TTS ✅
+    # - http: 分句 HTTP 模式，LLM 输出按标点分句后逐句请求 TTS
+    # - ws:   WebSocket 逐字流式模式，LLM 每个 token 即时送 TTS
     # Qwen3-TTS 和 VoxCPM2 均支持 http 和 ws 两种模式
     mode: http
 
@@ -225,7 +259,7 @@ services:
     timeout_s: 15
 
     # ---- 声音克隆配置（Qwen3-TTS 和 VoxCPM2 通用） ----
-    # 留空或注释则不使用声音克隆，使用预设音色或零样本模式
+    # 留空或设为 null 则不使用声音克隆，使用预设音色或零样本模式
     # ref_audio: 参考音频文件路径或 URL
     #   - 本地文件路径: /path/to/reference.wav（自动读取并转 base64 data URL）
     #   - HTTP URL: https://example.com/reference.wav（直接传递）
@@ -234,8 +268,8 @@ services:
     # ref_text: 参考音频对应的转录文本
     #   - Qwen3-TTS: 可选（不传则仅用参考音频音色）
     #   - VoxCPM2:   可选（传了则启用终极克隆模式，克隆效果最强）
-    # ref_audio: /path/to/reference.wav
-    # ref_text: "参考音频对应的转录文本"
+    ref_audio: null
+    ref_text: null
 
   # ---- GSV-TTS-Lite 语音克隆 TTS 配置 ----
   # 当 services.tts.model = gsv-tts-lite 时使用此配置
@@ -248,21 +282,41 @@ services:
 
     # 说话人参考音频路径（控制音色/谁在说话）
     # 支持本地文件路径或 HTTP/HTTPS URL
-    speaker_audio: ./examples/yaoyao.wav
+    # ⚠️ 用户需根据实际部署路径修改
+    speaker_audio: ""
 
     # 提示参考音频路径（控制风格/情感/怎么说）
     # 支持本地文件路径或 HTTP/HTTPS URL
-    prompt_audio: ./examples/yaoyao.wav
+    # ⚠️ 用户需根据实际部署路径修改
+    prompt_audio: ""
 
     # 提示文本（对应 prompt_audio 的文字内容）
     # 为空时自动使用 ASR 识别 prompt_audio 的内容
-    prompt_text: 今天天气很好，等下可以把你的被子拿出来晒晒。
+    prompt_text: ""
+
+    # 音频输出采样率（Hz）
+    sample_rate: 32000
 
     # HTTP 请求超时（秒）
     timeout_s: 30
 
     # 语速倍率
     speed: 1.0
+
+# ------------------------------------------------------------
+# TTS 参考音频配置
+# ------------------------------------------------------------
+tts:
+  # 参考音频文件目录（用于声音克隆时存放参考音频）
+  # ⚠️ 用户需根据实际部署路径修改
+  ref_audio_dir: ./ref_audio
+
+  # 允许的参考音频来源主机列表（空列表表示允许所有）
+  # 示例: ["example.com", "cdn.example.com"]
+  allowed_ref_audio_hosts: []
+
+  # 参考音频文件最大字节数（50MB）
+  max_ref_audio_bytes: 52428800
 
 # ------------------------------------------------------------
 # TTS 管线配置（控制 TTS 输出的后处理行为）
@@ -273,6 +327,9 @@ tts_pipeline:
   # - 较小值（4~6）: 更快开始合成，但可能断句不自然
   # - 较大值（8~12）: 更自然的断句，但首音频延迟略增
   min_sub_sentence_len: 6
+
+  # 最大并发 TTS 请求数
+  max_concurrent_tts: 2
 
   # 是否对 TTS 输出进行重采样
   # - true:  将 TTS 输出重采样到 output_sample_rate（可能降低音质）
