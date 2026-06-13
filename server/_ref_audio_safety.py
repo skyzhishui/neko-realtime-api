@@ -269,10 +269,16 @@ def ref_audio_config_from_app_config(app_cfg: object | None) -> RefAudioConfig:
     # The app config is a ServerConfig with a .get() method
     get_method = getattr(app_cfg, "get", None) if app_cfg is not None else None
     if callable(get_method):
-        ref_audio_dir_val = get_method("services", "tts", "ref_audio_dir", default=None)
+        # Try top-level tts.* first (canonical location per config.yaml.example);
+        # fall back to legacy services.tts.* for backward compat.
+        ref_audio_dir_val = get_method("tts", "ref_audio_dir", default=None)
+        if ref_audio_dir_val is None:
+            ref_audio_dir_val = get_method("services", "tts", "ref_audio_dir", default=None)
         if ref_audio_dir_val is not None:
             allowed_dir = Path(ref_audio_dir_val).resolve()
-        allowed_hosts_val = get_method("services", "tts", "allowed_ref_audio_hosts", default=None)
+        allowed_hosts_val = get_method("tts", "allowed_ref_audio_hosts", default=None)
+        if allowed_hosts_val is None:
+            allowed_hosts_val = get_method("services", "tts", "allowed_ref_audio_hosts", default=None)
         if allowed_hosts_val is not None:
             allowed_hosts = list(allowed_hosts_val)
     elif app_cfg is not None and hasattr(app_cfg, "tts"):

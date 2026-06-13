@@ -82,8 +82,40 @@ class ProtocolAdapter:
         except Exception as e:
             logger.warning(f"Failed to send WebSocket event: {e}")
 
-    async def send_error(self, msg: str):
-        await self.send({"type": "error", "error": msg})
+    async def send_error(self, msg: str, error_type: str = "invalid_request_error",
+                          code: str | None = None, event_id: str | None = None,
+                          param: str | None = None):
+        """Send an error event in OpenAI Realtime API format.
+
+        The OpenAI spec requires `error` to be an object, not a string:
+        ``{"type": "error", "error": {"type", "code", "message", "param", "event_id"}}``.
+
+        Args:
+            msg: Human-readable error message.
+            error_type: One of "invalid_request_error", "server_error", etc.
+                Defaults to "invalid_request_error" since most current callers
+                pass user-input-validation errors.
+            code: Optional machine-readable error code (e.g. "rate_limit_exceeded").
+            event_id: Optional ID of the client event that caused the error.
+            param: Optional parameter name that caused the error.
+        """
+        # Heuristic: if msg starts with "invalid_request_error:" or "server_error:",
+        # honor the prefix instead of the default error_type.
+        if isinstance(msg, str):
+            for prefix, etype in (("invalid_request_error:", "invalid_request_error"),
+                                   ("server_error:", "server_error")):
+                if msg.startswith(prefix):
+                    error_type = etype
+                    msg = msg[len(prefix):].strip()
+                    break
+        error_obj: dict = {"type": error_type, "message": msg}
+        if code is not None:
+            error_obj["code"] = code
+        if event_id is not None:
+            error_obj["event_id"] = event_id
+        if param is not None:
+            error_obj["param"] = param
+        await self.send({"type": "error", "error": error_obj})
 
     async def send_speech_started(self):
         await self.send({"type": "input_audio_buffer.speech_started"})

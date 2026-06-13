@@ -209,6 +209,7 @@ class RealtimeSession:
                 api_key=config.get("services", "tts", "api_key", default=""),
                 ref_audio=config.get("services", "tts", "ref_audio", default=None),
                 ref_text=config.get("services", "tts", "ref_text", default=None),
+                app_config=config,
             )
             self.directive_stripper = InlineDirectiveStripper()
             self.tts_mode = config.get("services", "tts", "mode", default="http")
@@ -222,6 +223,7 @@ class RealtimeSession:
                 sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
                 timeout_s=config.get("services", "tts", "timeout_s", default=15),
                 api_key=config.get("services", "tts", "api_key", default=None),
+                app_config=config,
             )
             self.gsv_tts_pipeline = GsvTtsPipeline(
                 base_url=config.get("services", "gsv_tts", "base_url", default="http://localhost:8001"),
@@ -231,6 +233,7 @@ class RealtimeSession:
                 sample_rate_out=config.get("tts_pipeline", "output_sample_rate", default=24000),
                 timeout_s=config.get("services", "gsv_tts", "timeout_s", default=30),
                 speed=config.get("services", "gsv_tts", "speed", default=1.0),
+                app_config=config,
             )
             self.directive_stripper = None
             self.tts_mode = "http"  # GSV-TTS-Lite forced HTTP mode
@@ -245,6 +248,7 @@ class RealtimeSession:
                 api_key=config.get("services", "tts", "api_key", default=None),
                 ref_audio=config.get("services", "tts", "ref_audio", default=None),
                 ref_text=config.get("services", "tts", "ref_text", default=None),
+                app_config=config,
             )
             self.directive_stripper = None
             self.gsv_tts_pipeline = None
@@ -907,6 +911,7 @@ class RealtimeSession:
                 api_key=self.config.get("services", "tts", "api_key", default=None),
                 ref_audio=self.tts_pipeline.ref_audio if hasattr(self.tts_pipeline, 'ref_audio') else None,
                 ref_text=self.tts_pipeline.ref_text if hasattr(self.tts_pipeline, 'ref_text') else None,
+                app_config=self.config,
             )
         else:
             ws_pipeline = TTSWebSocketPipeline(
