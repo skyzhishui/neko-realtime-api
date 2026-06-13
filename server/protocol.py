@@ -123,6 +123,26 @@ class ProtocolAdapter:
     async def send_speech_stopped(self):
         await self.send({"type": "input_audio_buffer.speech_stopped"})
 
+    async def send_input_audio_buffer_committed(self, item_id: str | None = None,
+                                                  previous_item_id: str | None = None):
+        """Send input_audio_buffer.committed event.
+
+        Per OpenAI Realtime API spec, this is emitted after speech_stopped (in
+        server-VAD mode) or after a client commit, indicating the audio buffer
+        was committed to a user message. Clients (e.g. neko-fork) use it for
+        diagnostic counters/timestamps and for turn lifecycle bookkeeping.
+
+        Args:
+            item_id: Optional id of the user message item created from the buffer.
+            previous_item_id: Optional id of the item before the new one.
+        """
+        event: dict = {"type": "input_audio_buffer.committed"}
+        if item_id is not None:
+            event["item_id"] = item_id
+        if previous_item_id is not None:
+            event["previous_item_id"] = previous_item_id
+        await self.send(event)
+
     async def send_input_transcript(self, transcript: str):
         await self.send({
             "type": "conversation.item.input_audio_transcription.completed",
@@ -155,23 +175,41 @@ class ProtocolAdapter:
         """Send text delta."""
         await self.send({"type": "response.output_text.delta", "delta": text})
 
-    async def send_transcript_done(self):
-        await self.send({"type": "response.output_audio_transcript.done"})
+    async def send_transcript_done(self, transcript: str = ""):
+        """Send response.output_audio_transcript.done event.
+
+        Per OpenAI Realtime API spec, this event MUST carry the final
+        ``transcript`` string. Clients (e.g. neko-fork omni_realtime_client.py)
+        read ``event["transcript"]`` to flush the final transcript line.
+        Sending an empty string is allowed but yields a blank final caption.
+
+        Args:
+            transcript: Final assembled transcript text. Pass the accumulated
+                ``full_text`` from the LLM streaming loop.
+        """
+        await self.send({
+            "type": "response.output_audio_transcript.done",
+            "transcript": transcript,
+        })
 
     async def send_response_done(self, resp_id: str, status: str = "completed",
-                                   status_details: dict | None = None, usage: dict | None = None):
+                                   status_details: dict | None = None, usage: dict | None = None,
+                                   model: str | None = None):
         """Send response.done event with OpenAI-Realtime-API-compliant payload.
-        
+
         Args:
             resp_id: Response ID (e.g. "resp_0").
             status: One of "completed", "cancelled", "incomplete", "failed".
             status_details: Optional status details object.
             usage: Optional usage dict; missing keys will be filled with zeros.
+            model: Optional model name. Clients (e.g. neko-fork TokenTracker)
+                read ``response.model`` for per-model token accounting. Defaults
+                to ``"local-qwen-omni"`` if not provided.
         """
         response_obj = {
             "id": resp_id,
             "object": "realtime.response",
-            "model": "qwen-realtime",
+            "model": model or "local-qwen-omni",
             "status": status,
             "usage": _build_usage_object(usage),
         }

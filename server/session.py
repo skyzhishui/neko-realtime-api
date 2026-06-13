@@ -403,7 +403,7 @@ class RealtimeSession:
                     
                     # 2. 发送 response.done(cancelled) 给客户端
                     if self._current_resp_id:
-                        await self.protocol.send_response_done(self._current_resp_id, status="cancelled")
+                        await self.protocol.send_response_done(self._current_resp_id, status="cancelled", model=getattr(self.session_config, "_model", None))
                         self._current_resp_id = None
                     
                     # 3. 在 _response_lock 内设置 _is_responding = False（防止与 speech_stopped 竞态）
@@ -446,6 +446,10 @@ class RealtimeSession:
                 self._is_speech_active = False
                 
                 await self.protocol.send_speech_stopped()
+                # OpenAI Realtime spec: emit input_audio_buffer.committed after
+                # the server finalizes the audio buffer in server-VAD mode.
+                # Clients (neko-fork) use this for diagnostic counters.
+                await self.protocol.send_input_audio_buffer_committed()
                 
                 async with self._response_lock:
                     if self._is_responding:
@@ -548,6 +552,14 @@ class RealtimeSession:
         async with self._response_lock:
             if self._is_responding:
                 logger.warning("Response already in progress, ignoring response.create")
+                # OpenAI Realtime spec: emit error so client can route the
+                # rejection back to the originating event_id. Include the
+                # ``response_already_active`` keyword for clients that fall
+                # back to content matching when no event_id is propagated.
+                await self.protocol.send_error(
+                    "response_already_active: a response is already in progress",
+                    event_id=event.get("event_id"),
+                )
                 return
             self._is_responding = True
         
@@ -565,7 +577,7 @@ class RealtimeSession:
         """Handle response.cancel event."""
         await self._cancel_active_pipeline("client_cancel")
         if self._current_resp_id:
-            await self.protocol.send_response_done(self._current_resp_id, status="cancelled")
+            await self.protocol.send_response_done(self._current_resp_id, status="cancelled", model=getattr(self.session_config, "_model", None))
             self._current_resp_id = None
         async with self._response_lock:
             self._is_responding = False
@@ -585,22 +597,33 @@ class RealtimeSession:
             "enable_search": self.session_config.enable_search,
         }
 
-    async def _stream_llm_to_tts(self, messages: list[dict], resp_id: str):
+    async def _stream_llm_to_tts(self, messages: list[dict], resp_id: str) -> str:
         """公共 LLM→TTS 流式管线逻辑（带 tool calling 支持）。
 
         如果 session 配置了 tools，走 _stream_llm_with_tool_loop；
         否则走纯文本→TTS 直通路径。
 
         Returns:
-            str: LLM 生成的完整文本（用于写入 conversation history）
+            str: LLM 生成的完整文本（用于写入 conversation history）。
+                 即使下游 `_stream_llm_events_to_tts_*` 返回
+                 (full_text, tool_calls_seen, finish_reason) 三元组（无 tools
+                 时 tool_calls_seen/finish_reason 已无意义），此处统一解包成
+                 str，避免上游把 tuple 写进对话历史或传给 transcript_done。
         """
         if self.session_config.tools:
             return await self._stream_llm_with_tool_loop(messages, resp_id)
 
         if self.tts_mode == "ws":
-            return await self._stream_llm_events_to_tts_ws(messages, resp_id)
+            result = await self._stream_llm_events_to_tts_ws(messages, resp_id)
         else:
-            return await self._stream_llm_events_to_tts_http(messages, resp_id)
+            result = await self._stream_llm_events_to_tts_http(messages, resp_id)
+
+        # Normalize: the events helpers return a (full_text, tool_calls_seen,
+        # finish_reason) tuple even when tools are not configured. Take the
+        # first element so callers always receive a str.
+        if isinstance(result, tuple):
+            return result[0] if result else ""
+        return result
 
     # ---- Tool calling lifecycle ----
 
@@ -1137,12 +1160,15 @@ class RealtimeSession:
             else:
                 await self.protocol.send_error("internal error")
             if self._current_resp_id:
-                await self.protocol.send_response_done(self._current_resp_id, status="failed")
+                await self.protocol.send_response_done(self._current_resp_id, status="failed", model=getattr(self.session_config, "_model", None))
                 self._current_resp_id = None
             return
         
-        await self.protocol.send_transcript_done()
-        await self.protocol.send_response_done(resp_id, status="completed")
+        await self.protocol.send_transcript_done(full_text or "")
+        await self.protocol.send_response_done(
+            resp_id, status="completed",
+            model=getattr(self.session_config, "_model", None),
+        )
         self._current_resp_id = None
 
     async def _process_mode_a(self, captured_pcm: bytes, duration_ms: float, captured_images: list[str] | None = None):
@@ -1211,12 +1237,15 @@ class RealtimeSession:
             logger.error(f"Mode A LLM error: {e}", exc_info=True)
             await self.protocol.send_error("internal error")
             if self._current_resp_id:
-                await self.protocol.send_response_done(self._current_resp_id, status="failed")
+                await self.protocol.send_response_done(self._current_resp_id, status="failed", model=getattr(self.session_config, "_model", None))
                 self._current_resp_id = None
             return
         
-        await self.protocol.send_transcript_done()
-        await self.protocol.send_response_done(resp_id, status="completed")
+        await self.protocol.send_transcript_done(full_text or "")
+        await self.protocol.send_response_done(
+            resp_id, status="completed",
+            model=getattr(self.session_config, "_model", None),
+        )
         self._current_resp_id = None
 
     async def _process_text_input(self):
@@ -1239,15 +1268,18 @@ class RealtimeSession:
                 if full_text and not self.session_config.tools:
                     self.conversation.append({"role": "assistant", "content": full_text})
                 
-                await self.protocol.send_transcript_done()
-                await self.protocol.send_response_done(resp_id, status="completed")
+                await self.protocol.send_transcript_done(full_text or "")
+                await self.protocol.send_response_done(
+                    resp_id, status="completed",
+                    model=getattr(self.session_config, "_model", None),
+                )
                 self._current_resp_id = None
                 
             except Exception as e:
                 logger.error(f"Text input error: {e}", exc_info=True)
                 await self.protocol.send_error("internal error")
                 if self._current_resp_id:
-                    await self.protocol.send_response_done(self._current_resp_id, status="failed")
+                    await self.protocol.send_response_done(self._current_resp_id, status="failed", model=getattr(self.session_config, "_model", None))
                     self._current_resp_id = None
         finally:
             if self._active_pipeline_task is my_task:
@@ -1350,7 +1382,7 @@ class RealtimeSession:
             self._active_pipeline_task = None
         
         if self._current_resp_id:
-            await self.protocol.send_response_done(self._current_resp_id, status="cancelled")
+            await self.protocol.send_response_done(self._current_resp_id, status="cancelled", model=getattr(self.session_config, "_model", None))
             self._current_resp_id = None
         
         self._is_responding = False
