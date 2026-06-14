@@ -228,12 +228,34 @@ class VoxCpm2TtsPipeline:
 
                 # VoxCPM2 returns raw PCM16 48kHz stream (no WAV header, no SSE framing)
                 # Read chunked stream and resample 48kHz -> 24kHz
+                # ---- 跨 chunk PCM16 + decimation phase 对齐 (P0 fix B 方案) ----
+                # 双重对齐要求：
+                #   1. 字节对齐：_resample_48k_to_24k 内部会 trim 奇数字节，跨
+                #      chunk 调用时 trim 掉的字节会让下一 chunk 整体错位 1 byte。
+                #   2. decimation phase 对齐：函数无状态地做 samples[::2]，每次
+                #      都从 chunk[0] 开始取偶数索引。如果上个 chunk 输出了奇数
+                #      个 sample，下个 chunk 的 phase 会翻转 (sample[1,3,5,...]
+                #      代替 [0,2,4,...])，前几毫秒正常，之后整段杂音。
+                # 解决：leftover 缓冲到 **4 字节 (2 sample) 边界**，保证每次
+                # resample 输入字节数为 4 的倍数 → sample 数为偶数 → decimation
+                # 输出永远以 sample[0] 起点，phase 跨 chunk 一致。
+                leftover = b""
                 async for chunk in resp.content.iter_chunked(4096):
                     if not chunk:
                         continue
+                    buf = leftover + chunk
+                    rem = len(buf) % 4
+                    if rem:
+                        leftover = buf[-rem:]
+                        buf = buf[:-rem]
+                    else:
+                        leftover = b""
+                    if not buf:
+                        # chunk 累计 < 4 byte，全部入 leftover
+                        continue
 
-                    # Resample 48kHz -> 24kHz
-                    pcm_24k = self._resample_48k_to_24k(chunk)
+                    # Resample 48kHz -> 24kHz (输入恒为 4 字节倍数 → 偶数 sample)
+                    pcm_24k = self._resample_48k_to_24k(buf)
 
                     if pcm_24k:
                         if not first_chunk_logged:
@@ -244,6 +266,11 @@ class VoxCpm2TtsPipeline:
                             )
                             first_chunk_logged = True
                         yield pcm_24k
+                # 流末尾若仍有 1-3 byte residual，丢弃 (不足 1 个完整 24kHz sample)
+                if leftover:
+                    logger.debug(
+                        f"[VoxCPM2-TTS] discarded {len(leftover)} trailing byte(s) at stream end"
+                    )
 
         except asyncio.CancelledError:
             logger.info("[VoxCPM2-TTS] stream_tts cancelled")
@@ -413,12 +440,26 @@ class VoxCpm2TtsWsPipeline:
         control messages. Binary frames are 48kHz PCM16 and are decimated
         to 24kHz before being queued.
         """
+        # ---- 跨 frame PCM16 + decimation phase 对齐 (P0 fix B 方案) ----
+        # 与 HTTP 路径同理：_resample_48k_to_24k 是无状态函数，跨 frame 调用
+        # 必须保证每次输入 (1) 字节为偶数 (2) sample 数为偶数。统一缓冲到 4
+        # 字节 (2 sample) 边界，避免奇数字节 trim 错位 + decimation phase 翻转。
+        leftover = b""
         try:
             async for message in self._ws:
                 if isinstance(message, bytes):
                     # Binary PCM chunk (S16_LE 48kHz mono from VoxCPM2)
                     # Decimate 48kHz -> 24kHz before queueing
-                    pcm_24k = VoxCpm2TtsPipeline._resample_48k_to_24k(message)
+                    buf = leftover + message
+                    rem = len(buf) % 4
+                    if rem:
+                        leftover = buf[-rem:]
+                        buf = buf[:-rem]
+                    else:
+                        leftover = b""
+                    if not buf:
+                        continue
+                    pcm_24k = VoxCpm2TtsPipeline._resample_48k_to_24k(buf)
                     if pcm_24k:
                         await self._audio_queue.put(pcm_24k)
                 elif isinstance(message, str):
@@ -472,6 +513,12 @@ class VoxCpm2TtsWsPipeline:
             logger.error(f"VoxCPM2 WS receive error: {e}")
             self._error = str(e)
             await self._audio_queue.put(None)
+        finally:
+            # 流末尾若仍有 1-3 byte residual，丢弃 (不足 1 个完整 24kHz sample)
+            if leftover:
+                logger.debug(
+                    f"[VoxCPM2-WS] discarded {len(leftover)} trailing byte(s) at stream end"
+                )
 
     async def receive_audio(self) -> AsyncIterator[bytes]:
         """Async iterator that yields PCM chunks from VoxCPM2 TTS.
