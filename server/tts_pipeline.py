@@ -183,14 +183,37 @@ class TTSPipeline:
                     error_text = await resp.text()
                     logger.error(f"TTS error {resp.status}: {error_text[:500]}")
                     return
-                
+
+                # ---- 跨 chunk PCM16 sample 对齐 (P0 fix B 方案) ----
+                # aiohttp.iter_chunked(N) 不保证字节边界与 PCM16 sample (2 byte)
+                # 对齐：HTTP/TCP 在任意字节切分，最后一 chunk 极易奇数字节。
+                # 不修则下游 (protocol.send_audio_delta) 必须兜底，但兜底只能把
+                # 奇数尾字节"暂存"到下一 chunk，无法防止 VoxCPM2 那种 resample
+                # 内部 trim 导致的跨 chunk 错位。在生产者端做 leftover 缓冲，
+                # 让 yield 出去的 chunk 始终 sample-aligned (字节数为偶数)。
+                leftover = b""
                 async for chunk in resp.content.iter_chunked(4096):
-                    if chunk:
-                        if not first_chunk_logged:
-                            latency_ms = (time.time() - t_tts_sent) * 1000
-                            logger.info(f'[TRACE] tts_first_chunk: latency={latency_ms:.1f}ms, text="{text[:30]}"')
-                            first_chunk_logged = True
-                        yield chunk
+                    if not chunk:
+                        continue
+                    buf = leftover + chunk
+                    if len(buf) & 1:
+                        leftover = buf[-1:]
+                        buf = buf[:-1]
+                    else:
+                        leftover = b""
+                    if not buf:
+                        # chunk 只贡献 1 byte，全部入 leftover 等待下一 chunk
+                        continue
+                    if not first_chunk_logged:
+                        latency_ms = (time.time() - t_tts_sent) * 1000
+                        logger.info(f'[TRACE] tts_first_chunk: latency={latency_ms:.1f}ms, text="{text[:30]}"')
+                        first_chunk_logged = True
+                    yield buf
+                # 流末尾若仍有 1 byte residual，丢弃 (单字节无法构成有效 sample)。
+                if leftover:
+                    logger.debug(
+                        f"[Qwen3-TTS] discarded {len(leftover)} trailing odd byte(s) at stream end"
+                    )
 
         except asyncio.CancelledError:
             logger.info("[Qwen3-TTS] stream_tts cancelled")
