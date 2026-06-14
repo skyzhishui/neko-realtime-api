@@ -279,6 +279,22 @@ class RealtimeSession:
         # 打断时调用 _cancel_active_pipeline() 取消旧pipeline
         self._active_pipeline_task: asyncio.Task | None = None
 
+        # ---- Audio drain background tasks (P0 fix: HTTP TTS 断流) ----
+        # _stream_llm_events_to_tts_http 在 LLM 流结束后立即返回，
+        # 把 drain_task 暴露给 caller，由 caller 在发完 transcript.done 后
+        # 通过 _await_audio_drain() 等待所有 audio.delta 发送完毕，再发
+        # response.done。详见 .omo/plans/http-tts-断流-p0-fix.md。
+        self._audio_drain_task: asyncio.Task | None = None
+        self._audio_tts_tasks: list[asyncio.Task] | None = None
+
+        # ---- Pipeline epoch (P0 fix v2: cross-round task isolation) ----
+        # 每次 _cancel_active_pipeline / cleanup 递增。
+        # sentence task 和 drain task spawn 时捕获当时的 epoch，每次关键
+        # await 前后自检：if epoch != self._pipeline_epoch: return。
+        # 这样旧轮 task 不会发 audio_delta 到新轮，也不会等 HTTP timeout
+        # 才退出（在 ms 级响应 cancel）。
+        self._pipeline_epoch: int = 0
+
         # ---- VAD offload executor ----
         self._vad_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad")
 
@@ -470,36 +486,96 @@ class RealtimeSession:
 
     async def _cancel_active_pipeline(self, reason: str):
         """取消当前活跃的pipeline task。
-        
-        通过 asyncio.Task.cancel() 触发 CancelledError 传播到整个pipeline。
-        不在打断路径上 await 被取消的 task，避免 ONNX 推理中途的同步等待。
+
+        P0 fix v2 - epoch + 同步 reap：
+        ===========================================================
+        1. 递增 self._pipeline_epoch → 旧轮 sentence/drain task 在
+           下一个 await 点的 epoch 自检发现不匹配 → 主动 return（无需
+           等 HTTP chunk timeout），ms 级退出。
+        2. cancel 所有已知 task，然后**同步 await asyncio.gather**
+           （1s timeout 兜底）确保它们真正退出 — 消灭 fire-and-forget，
+           确保 "Task was destroyed but it is pending" 不再发生。
+        3. 不阻塞新轮启动：epoch 递增 + cancel 是 O(1)，gather 在
+           epoch 自检助力下通常 <100ms 完成。
+
+        修复前的回归 (v1)：用 asyncio.create_task(_cleanup_*) 做
+        fire-and-forget cleanup → 旧 sentence task 还在 await TTS
+        chunk → cancel 信号要等 HTTP timeout 才生效 → 新一轮已经开始
+        → session destroy 时旧 task 还没死 → Python 报
+        "Task was destroyed but it is pending"，且打断后仍有音频
+        bleed 到新一轮。
         """
+        # ---- 1. 递增 epoch：旧轮 task 自检后会主动退出 ----
+        old_epoch = self._pipeline_epoch
+        self._pipeline_epoch += 1
+        logger.info(
+            f"[Session] _cancel_active_pipeline(reason={reason}), "
+            f"epoch {old_epoch} → {self._pipeline_epoch}"
+        )
+
+        tasks_to_reap: list[asyncio.Task] = []
+
+        # ---- 2. cancel 主 pipeline task ----
         if self._active_pipeline_task is not None and not self._active_pipeline_task.done():
-            logger.info(
-                f"[Session] Cancelling active pipeline task (reason={reason}), "
-                f"task_done={self._active_pipeline_task.done()}"
-            )
             task = self._active_pipeline_task
             self._active_pipeline_task = None
             task.cancel()
-            # Fire-and-forget: await the task in background to ensure
-            # CancelledError is consumed and resources are cleaned up,
-            # but don't block the interruption path.
-            async def _cleanup_cancelled_task(t: asyncio.Task):
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    logger.info("[Session] Active pipeline task cancelled successfully (background cleanup)")
-                except Exception as e:
-                    logger.warning(f"[Session] Active pipeline task cancellation error (background cleanup): {e}")
-            
-            asyncio.create_task(_cleanup_cancelled_task(task))
-        
-        # 同时确保interruption状态也被清理
-        # 这样pipeline内部的 should_cancel() 检查也能生效（作为辅助检查）
+            tasks_to_reap.append(task)
+        else:
+            # already done or never started — clear ref defensively
+            self._active_pipeline_task = None
+
+        # ---- 3. cancel drain / tts tasks ----
+        # 必须在 _active_pipeline_task 之外独立 cancel：
+        #  1. 当 caller 已 return 出 _stream_llm_events_to_tts_http、
+        #     正在 await self._await_audio_drain() 时，drain_task 已
+        #     被 caller "持有"——主 task 的 except 块覆盖不到它。
+        #  2. 即使主 task cancel 链路已触发，drain_task 仍可能继续
+        #     send_audio_delta，造成"打断后仍有音频"。
+        drain_task = self._audio_drain_task
+        tts_tasks = self._audio_tts_tasks
+        self._audio_drain_task = None
+        self._audio_tts_tasks = None
+
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            tasks_to_reap.append(drain_task)
+        if tts_tasks:
+            for t in tts_tasks:
+                if not t.done():
+                    t.cancel()
+                    tasks_to_reap.append(t)
+
+        # ---- 4. 同步 reap：1s timeout 兜底 ----
+        # epoch 自检让 task 在 ms 级退出；timeout 只防极端情况
+        # （aiohttp 连接卡死、ONNX 推理同步阻塞等）。
+        if tasks_to_reap:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_reap, return_exceptions=True),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                # 即便超时，旧 epoch 的 task 不会再 send_audio_delta
+                # （drain_loop 会在下一次 epoch 自检 return），故对客户端
+                # 而言无副作用；只是这些 task 仍在跑。日志记录后放任。
+                pending = sum(1 for t in tasks_to_reap if not t.done())
+                logger.warning(
+                    f"[Session] {pending}/{len(tasks_to_reap)} cancelled tasks "
+                    f"did not exit within 1s (epoch self-check should have "
+                    f"forced them out — possible aiohttp/ONNX hard hang)"
+                )
+
+        # ---- 5. interruption flag ----
         if self.interruption.is_generating:
             logger.info(f"[Session] Setting interruption cancel flag (reason={reason})")
             self.interruption.set_generating(False)
+
+        # ---- 6. drop PCM byte residual: 旧轮残余字节不能跨 response 拼接 ----
+        # send_audio_delta 在跨 chunk 字节对齐时会暂存奇数尾字节；
+        # 打断后本轮 PCM 流终止，这 1 byte 必须丢弃，否则下一轮第一个
+        # audio_delta 会被错位 1 byte，整段音频杂音。
+        self.protocol.reset_audio_residual()
 
     async def _handle_audio_clear(self, event: dict):
         """Handle input_audio_buffer.clear event."""
@@ -625,6 +701,78 @@ class RealtimeSession:
             return result[0] if result else ""
         return result
 
+    # ---- Audio drain helpers (P0 fix: HTTP TTS 断流) ----
+
+    async def _await_audio_drain(self) -> None:
+        """Await the background audio drain_task + per-sentence tts_tasks.
+
+        Caller pattern (Mode B / Mode A / text_input):
+
+            full_text = await self._stream_llm_to_tts(messages, resp_id)
+            await self.protocol.send_transcript_done(full_text or "")
+            await self._await_audio_drain()
+            await self.protocol.send_response_done(
+                resp_id, status="completed", model=...,
+            )
+
+        Idempotent: if no drain is in flight, returns immediately.
+        Clears self._audio_drain_task / self._audio_tts_tasks before
+        returning so subsequent calls are safe.
+        """
+        drain_task = self._audio_drain_task
+        tts_tasks = self._audio_tts_tasks
+        self._audio_drain_task = None
+        self._audio_tts_tasks = None
+
+        if drain_task is not None and not drain_task.done():
+            try:
+                await drain_task
+            except asyncio.CancelledError:
+                # Cancellation must propagate to caller
+                raise
+            except Exception:
+                logger.exception(
+                    "[Session] audio drain_task raised unexpected error"
+                )
+
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+        # ---- drop PCM byte residual at response boundary ----
+        # drain 完成 = 本轮 audio.delta 已全部发完。若上游 TTS 流末尾产生
+        # 奇数字节（HTTP chunked 边界），send_audio_delta 会把最后 1 byte
+        # 暂存在 _audio_residual。此处丢弃，避免污染下一 response 第一个 chunk。
+        self.protocol.reset_audio_residual()
+
+    async def _cleanup_audio_tasks_on_error(self) -> None:
+        """Cancel + reap drain_task and tts_tasks on non-CancelledError paths.
+
+        Used by callers in their generic ``except Exception`` blocks to
+        prevent task leaks when the pipeline aborts mid-flight.
+        """
+        drain_task = self._audio_drain_task
+        tts_tasks = self._audio_tts_tasks
+        self._audio_drain_task = None
+        self._audio_tts_tasks = None
+
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            try:
+                await drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if tts_tasks:
+            for t in tts_tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+        # ---- drop PCM byte residual on error path ----
+        # 异常中止意味着本轮 PCM 流不完整，残余字节必须丢弃，
+        # 否则下一 response 第一个 audio.delta 会被错位 1 byte。
+        self.protocol.reset_audio_residual()
+
     # ---- Tool calling lifecycle ----
 
     async def _stream_llm_with_tool_loop(self, messages: list[dict], resp_id: str) -> str:
@@ -657,6 +805,12 @@ class RealtimeSession:
                 round_text, round_tc, round_fr = await self._stream_llm_events_to_tts_http(
                     current_messages, resp_id, output_index,
                 )
+
+            # ---- P0 fix: 等本轮 audio drain 完成后再进入下一轮 ----
+            # 否则下一轮的 _stream_llm_events_to_tts_* 会覆写
+            # self._audio_drain_task / self._audio_tts_tasks，导致前一轮的
+            # drain_task 引用丢失，造成音频乱序或 task leak。
+            await self._await_audio_drain()
 
             text_parts.append(round_text)
             tool_calls_seen = round_tc
@@ -788,36 +942,66 @@ class RealtimeSession:
         tts_tasks: list[asyncio.Task] = []
         all_sentences_enqueued = False
 
-        async def _process_sentence_tts(sentence: str, queue: asyncio.Queue):
+        # ---- P0 fix v2: capture epoch for cross-round task isolation ----
+        # 每个 sentence task / drain task 在 spawn 时记录当时的 epoch，
+        # 在每次关键 await 前后自检：如果 self._pipeline_epoch 已被
+        # _cancel_active_pipeline 递增，说明本轮已被打断 → 立即 return，
+        # 不再 send_audio_delta / put queue（避免 bleed 到新一轮）。
+        my_epoch = self._pipeline_epoch
+
+        async def _process_sentence_tts(sentence: str, queue: asyncio.Queue, epoch: int):
             async with tts_semaphore:
                 try:
+                    # epoch 自检：若已过期，跳过 HTTP TTS 请求
+                    if epoch != self._pipeline_epoch:
+                        return
                     if tts_model == "gsv-tts-lite":
                         async for pcm_chunk in active_tts_pipeline.stream_tts(sentence):
+                            if epoch != self._pipeline_epoch:
+                                return
                             await queue.put(pcm_chunk)
                     elif tts_model == "voxcpm2":
                         async for pcm_chunk in active_tts_pipeline.stream_tts(sentence):
+                            if epoch != self._pipeline_epoch:
+                                return
                             await queue.put(pcm_chunk)
                     else:  # Qwen3-TTS
                         async for pcm_chunk in active_tts_pipeline.stream_tts(
                             sentence, instructions="",
                         ):
+                            if epoch != self._pipeline_epoch:
+                                return
                             await queue.put(pcm_chunk)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     logger.error(f"TTS error for sentence: {e}", exc_info=True)
                 finally:
-                    await queue.put(None)
+                    # 即使 epoch stale 提早 return，也要 put None 让 drain_loop
+                    # 不卡死。**用 put_nowait 避免 queue 满时阻塞**——
+                    # cancel 路径下 drain_loop 已死，没人取，put() 会无限挂起。
+                    try:
+                        queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        # drain 已不再消费——直接放弃 sentinel；drain_loop
+                        # 自己也会通过 epoch 自检退出，不会泄漏。
+                        pass
 
-        async def _drain_loop():
+        async def _drain_loop(epoch: int):
             drain_idx = 0
             while True:
+                # epoch 自检：本轮已被打断，立即退出，不再发任何 audio_delta
+                if epoch != self._pipeline_epoch:
+                    return
                 if drain_idx < len(sentence_audio_queues):
                     q = sentence_audio_queues[drain_idx]
                     while True:
                         chunk = await q.get()
                         if chunk is None:
                             break
+                        # 发 audio_delta 前再次自检，防止旧轮 chunk bleed 到新轮
+                        if epoch != self._pipeline_epoch:
+                            return
                         await self.protocol.send_audio_delta(chunk)
                     drain_idx += 1
                 elif all_sentences_enqueued:
@@ -825,7 +1009,14 @@ class RealtimeSession:
                 else:
                     await asyncio.sleep(0.005)
 
-        drain_task = asyncio.create_task(_drain_loop())
+        drain_task = asyncio.create_task(_drain_loop(my_epoch))
+        # ---- P0 fix: 暴露 drain_task 给 caller ----
+        # caller (_process_mode_b/_process_mode_a/_process_text_input) 必须在
+        # 本函数 return 后调用 self._await_audio_drain() 等待 drain 完成；
+        # 在打断/异常路径，由 _cancel_active_pipeline()/
+        # _cleanup_audio_tasks_on_error() 负责清理。
+        self._audio_drain_task = drain_task
+        self._audio_tts_tasks = tts_tasks
 
         try:
             async for event in self.omni_client.stream_chat(
@@ -847,9 +1038,9 @@ class RealtimeSession:
                         sentences = splitter.add_text(text_delta)
                         for sentence in sentences:
                             logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}')
-                            q = asyncio.Queue()
+                            q = asyncio.Queue(maxsize=64)
                             sentence_audio_queues.append(q)
-                            task = asyncio.create_task(_process_sentence_tts(sentence, q))
+                            task = asyncio.create_task(_process_sentence_tts(sentence, q, my_epoch))
                             tts_tasks.append(task)
 
                 elif event["type"] == "tool_call":
@@ -888,15 +1079,15 @@ class RealtimeSession:
             if not has_tool_calls:
                 for sentence in splitter.flush():
                     logger.info(f'[TRACE] tts_sentence: text="{sentence}", sentence_len={len(sentence)}(flush)')
-                    q = asyncio.Queue()
+                    q = asyncio.Queue(maxsize=64)
                     sentence_audio_queues.append(q)
-                    task = asyncio.create_task(_process_sentence_tts(sentence, q))
+                    task = asyncio.create_task(_process_sentence_tts(sentence, q, my_epoch))
                     tts_tasks.append(task)
 
             all_sentences_enqueued = True
-            await drain_task
-            if tts_tasks:
-                await asyncio.gather(*tts_tasks, return_exceptions=True)
+            # ---- P0 fix: 不再 await drain_task / asyncio.gather(tts_tasks) ----
+            # caller 通过 self._await_audio_drain() 在合适时机等待。
+            # 这样 caller 可以先发 transcript.done（无需等 audio drain 完）。
 
         except asyncio.CancelledError:
             logger.info("[Session] HTTP TTS pipeline cancelled (CancelledError propagated)")
@@ -905,6 +1096,21 @@ class RealtimeSession:
             for task in tts_tasks:
                 if not task.done():
                     task.cancel()
+            # ---- P0 fix v2: 同步 reap，防止 "Task was destroyed but it is pending" ----
+            # 旧版：只 cancel + 清引用，不 await → 旧 task 可能在
+            # session.cleanup 时仍 pending → Python GC 报错。
+            # 现在：CancelledError 路径同步 await gather，确保 task 真正退出。
+            # epoch 自检让 task 在 ms 级响应 cancel；正常情况这里 <100ms。
+            try:
+                await asyncio.shield(
+                    asyncio.gather(*([drain_task] + tts_tasks), return_exceptions=True)
+                )
+            except asyncio.CancelledError:
+                # 即使 reap 自身被 re-cancel（罕见），也要让原始 CancelledError 传播
+                pass
+            # 清理引用，避免 caller 在 cancel 路径下误用已 cancel 的 task
+            self._audio_drain_task = None
+            self._audio_tts_tasks = None
             raise
 
         return full_text, tool_calls_seen, finish_reason
@@ -1145,15 +1351,26 @@ class RealtimeSession:
                 self.conversation.append({"role": "assistant", "content": full_text})
             
             self.mode_router.report_omni_success()
-            
+
+            # ---- P0 fix: send transcript.done IMMEDIATELY after LLM stream ----
+            # 不再等 audio drain 完才发 transcript.done，避免客户端 idle timeout。
+            # 详见 .omo/plans/http-tts-断流-p0-fix.md。
+            await self.protocol.send_transcript_done(full_text or "")
+
+            # ---- await background audio drain before response.done ----
+            await self._await_audio_drain()
+
         except asyncio.CancelledError:
             # 被用户打断，不继续处理
+            # drain_task 由 _cancel_active_pipeline() 负责清理，这里不重复操作
             logger.info("[Session] Mode B pipeline cancelled by interruption")
             raise
         except Exception as e:
             logger.error(f"Mode B error: {e}", exc_info=True)
             self.mode_router.report_omni_error()
-            
+            # 异常路径：清理 background drain/tts tasks，避免泄漏
+            await self._cleanup_audio_tasks_on_error()
+
             if self.mode_router.get_mode() == ModeRouter.MODE_A:
                 logger.info("Falling back to Mode A after Omni error")
                 await self.protocol.send_error("Omni error, falling back to ASR mode")
@@ -1164,7 +1381,6 @@ class RealtimeSession:
                 self._current_resp_id = None
             return
         
-        await self.protocol.send_transcript_done(full_text or "")
         await self.protocol.send_response_done(
             resp_id, status="completed",
             model=getattr(self.session_config, "_model", None),
@@ -1228,20 +1444,26 @@ class RealtimeSession:
             # Only append to conversation if tool loop isn't handling it
             if full_text and not self.session_config.tools:
                 self.conversation.append({"role": "assistant", "content": full_text})
-            
+
+            # ---- P0 fix: send transcript.done IMMEDIATELY after LLM stream ----
+            await self.protocol.send_transcript_done(full_text or "")
+
+            # ---- await background audio drain before response.done ----
+            await self._await_audio_drain()
+
         except asyncio.CancelledError:
-            # 被用户打断
+            # 被用户打断；drain_task 由 _cancel_active_pipeline() 清理
             logger.info("[Session] Mode A LLM pipeline cancelled by interruption")
             raise
         except Exception as e:
             logger.error(f"Mode A LLM error: {e}", exc_info=True)
+            await self._cleanup_audio_tasks_on_error()
             await self.protocol.send_error("internal error")
             if self._current_resp_id:
                 await self.protocol.send_response_done(self._current_resp_id, status="failed", model=getattr(self.session_config, "_model", None))
                 self._current_resp_id = None
             return
         
-        await self.protocol.send_transcript_done(full_text or "")
         await self.protocol.send_response_done(
             resp_id, status="completed",
             model=getattr(self.session_config, "_model", None),
@@ -1267,16 +1489,25 @@ class RealtimeSession:
                 # Only append to conversation if tool loop isn't handling it
                 if full_text and not self.session_config.tools:
                     self.conversation.append({"role": "assistant", "content": full_text})
-                
+
+                # ---- P0 fix: send transcript.done IMMEDIATELY after LLM stream ----
                 await self.protocol.send_transcript_done(full_text or "")
+
+                # ---- await background audio drain before response.done ----
+                await self._await_audio_drain()
+
                 await self.protocol.send_response_done(
                     resp_id, status="completed",
                     model=getattr(self.session_config, "_model", None),
                 )
                 self._current_resp_id = None
                 
+            except asyncio.CancelledError:
+                # drain_task 由 _cancel_active_pipeline() 清理
+                raise
             except Exception as e:
                 logger.error(f"Text input error: {e}", exc_info=True)
+                await self._cleanup_audio_tasks_on_error()
                 await self.protocol.send_error("internal error")
                 if self._current_resp_id:
                     await self.protocol.send_response_done(self._current_resp_id, status="failed", model=getattr(self.session_config, "_model", None))
@@ -1367,38 +1598,78 @@ class RealtimeSession:
         return self._build_base_messages()
 
     async def cleanup(self):
-        """Clean up session resources."""
+        """Clean up session resources.
+
+        P0 fix v2: synchronously reap _audio_drain_task / _audio_tts_tasks
+        in addition to _active_pipeline_task, with epoch increment to force
+        early exit. Prior to this fix, drain/tts tasks could keep running
+        for 30-40 seconds after cleanup (logging "TTS streaming error" and
+        leaking "Task was destroyed but it is pending").
+        """
         logger.info("Cleaning up session")
-        
-        # 清理时也取消活跃的pipeline task
+
+        # ---- 递增 epoch：所有后台 task 自检后会主动退出 ----
+        self._pipeline_epoch += 1
+
+        tasks_to_reap: list[asyncio.Task] = []
+
+        # 主 pipeline task
         if self._active_pipeline_task is not None and not self._active_pipeline_task.done():
             self._active_pipeline_task.cancel()
+            tasks_to_reap.append(self._active_pipeline_task)
+        self._active_pipeline_task = None
+
+        # 后台 audio drain / sentence TTS tasks
+        if self._audio_drain_task is not None and not self._audio_drain_task.done():
+            self._audio_drain_task.cancel()
+            tasks_to_reap.append(self._audio_drain_task)
+        self._audio_drain_task = None
+
+        if self._audio_tts_tasks:
+            for t in self._audio_tts_tasks:
+                if not t.done():
+                    t.cancel()
+                    tasks_to_reap.append(t)
+        self._audio_tts_tasks = None
+
+        # 同步 reap（2s timeout 兜底；正常 epoch 自检 <100ms 完成）
+        if tasks_to_reap:
             try:
-                await self._active_pipeline_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_reap, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                pending = sum(1 for t in tasks_to_reap if not t.done())
+                logger.warning(
+                    f"[Session] cleanup: {pending}/{len(tasks_to_reap)} tasks "
+                    f"did not exit within 2s"
+                )
+
+        # 防御性清空 PCM 字节残余（session 即将关闭，不再有 audio_delta）
+        self.protocol.reset_audio_residual()
+
+        if self._current_resp_id:
+            try:
+                await self.protocol.send_response_done(self._current_resp_id, status="cancelled", model=getattr(self.session_config, "_model", None))
             except Exception:
                 pass
-            self._active_pipeline_task = None
-        
-        if self._current_resp_id:
-            await self.protocol.send_response_done(self._current_resp_id, status="cancelled", model=getattr(self.session_config, "_model", None))
             self._current_resp_id = None
-        
+
         self._is_responding = False
         self._is_speech_active = False
         self.audio_buffer.reset()
         self.vad.reset()
         self.conversation.clear()
-        
+
         await self.omni_client.close()
         await self.asr_client.close()
         await self.tts_pipeline.close()
         if self.gsv_tts_pipeline:
             await self.gsv_tts_pipeline.close()
-        
+
         # Flush directive stripper on session cleanup
         if self.directive_stripper:
             self.directive_stripper.reset()
-        
+
         self._vad_executor.shutdown(wait=False)

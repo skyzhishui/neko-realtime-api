@@ -74,6 +74,15 @@ class ProtocolAdapter:
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
         self._response_counter = 0
+        # ---- Audio chunk 2-byte alignment guard (PCM16 sample boundary) ----
+        # 上游 TTS pipeline (尤其 Qwen3-TTS HTTP `iter_chunked(4096)`) 不保证
+        # 每个 chunk 的字节数是 2 的倍数。客户端 np.frombuffer(dtype=np.int16)
+        # 要求字节数为偶数，否则抛 "buffer size must be a multiple of element size"
+        # 并中断 message loop。这里在协议出口集中做对齐：跨 chunk 暂存奇数尾字节，
+        # 与下一 chunk 拼接后再发出，保证 send_audio_delta 出口字节数永远偶数。
+        # response 边界（completed / cancelled / error / 打断）必须调用
+        # reset_audio_residual() 清空残余字节，避免污染下一轮 PCM sample 对齐。
+        self._audio_residual: bytes = b""
 
     async def send(self, event: dict):
         """Send raw event as JSON."""
@@ -163,9 +172,49 @@ class ProtocolAdapter:
         return resp_id
 
     async def send_audio_delta(self, pcm_bytes: bytes):
-        """Send audio delta. Output is 24kHz PCM16."""
-        b64 = base64.b64encode(pcm_bytes).decode()
+        """Send audio delta. Output is 24kHz PCM16 (must be 2-byte aligned).
+
+        客户端按 PCM16 (int16) 解码 audio_delta，要求字节数为 2 的倍数。
+        上游 TTS pipeline 的 chunk 边界（尤其 Qwen3-TTS HTTP iter_chunked）
+        不保证 sample 对齐，可能 yield 奇数字节 chunk。本函数把奇数尾字节暂存
+        到 self._audio_residual，下次调用与新 chunk 拼接后再发出。
+
+        每个 response 结束 / 打断 / 错误时必须调用 reset_audio_residual()，
+        否则跨 response 残余字节会让下一轮 PCM sample 整体错位 1 byte，
+        造成杂音。
+        """
+        if pcm_bytes:
+            buf = self._audio_residual + pcm_bytes
+        else:
+            # 空 chunk：什么也不做（也不发送空 delta）
+            return
+
+        if len(buf) & 1:
+            self._audio_residual = buf[-1:]
+            buf = buf[:-1]
+        else:
+            self._audio_residual = b""
+
+        if not buf:
+            # 整个 chunk 只有 1 字节，全部暂存到 residual，本次不发送
+            return
+
+        b64 = base64.b64encode(buf).decode()
         await self.send({"type": "response.output_audio.delta", "delta": b64})
+
+    def reset_audio_residual(self) -> None:
+        """Drop any pending odd-byte residual at response boundaries.
+
+        Call this on:
+          - response.done (completed / failed / cancelled)
+          - 打断 / _cancel_active_pipeline
+          - session cleanup
+          - 任何会切换 PCM 流上下文的位置
+
+        丢弃 residual 比把残余字节带入下一 response 更安全：单字节本身
+        是某 sample 的高位或低位，跨 response 拼接会让整段音频错位。
+        """
+        self._audio_residual = b""
 
     async def send_transcript_delta(self, text: str):
         """Send transcript delta."""
