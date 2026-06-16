@@ -44,6 +44,11 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("[Startup] local_asr=false, skipping ASR pre-load")
 
+    # 3. 预热 HTTP ASR 端点的音频解码/重采样流水线（首次 librosa.resample
+    #    在 24k->16k 上耗时 ~900ms，预热后可消除该抖动）
+    from .transcription_endpoint import warmup_audio_pipeline
+    await loop.run_in_executor(None, warmup_audio_pipeline)
+
     yield  # application is running
 
     # --- Shutdown ---
@@ -51,6 +56,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LocalOmniRealtimeServer", lifespan=lifespan)
+
+# 挂载 OpenAI 兼容的 ASR HTTP 端点 POST /v1/audio/transcriptions
+# 复用启动时预加载的 LocalASREngine（local_asr=true 时）或转发到远程 ASR
+from .transcription_endpoint import register_transcription_routes  # noqa: E402
+
+register_transcription_routes(app)
 
 
 @app.websocket("/v1/realtime")

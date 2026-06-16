@@ -107,7 +107,41 @@ VAD 使用 Silero VAD 模型的 ONNX 推理后端，无需 PyTorch 依赖。Smar
 |------|------|------|
 | `/` | GET | 服务信息 |
 | `/health` | GET | 健康检查 |
+| `/v1/audio/transcriptions` | POST | OpenAI 兼容语音转写（multipart 上传） |
 | `/v1/realtime` | WebSocket | 实时语音对话 |
+
+### 语音转写端点（POST /v1/audio/transcriptions）
+
+OpenAI Whisper 协议兼容的独立 ASR 端点，与 WebSocket 端点共享同一份 ASR 引擎（`local_asr=true` 时复用启动预加载的本地模型，否则转发到 `services.asr.base_url`）。
+
+**请求**：
+
+```bash
+curl -X POST http://localhost:8765/v1/audio/transcriptions \
+  -H "Authorization: Bearer <auth_token>" \
+  -F "file=@audio.wav" \
+  -F "model=SenseVoiceSmall" \
+  -F "language=zh"
+```
+
+| Form 字段 | 说明 | 默认值 |
+|-----------|------|--------|
+| `file`    | 音频文件，支持 WAV/FLAC/OGG/MP3 等 soundfile 可解码格式，或原始 int16 PCM | 必填 |
+| `model`   | 兼容字段，忽略（实际使用本地或远程配置） | `SenseVoiceSmall` |
+| `language` | 语言代码 `zh` / `en` / `ja` / `ko` / `auto` | `auto` |
+
+**响应**：
+
+```json
+{"text": "识别得到的文本"}
+```
+
+**认证**：与 WebSocket 端点共用 `security.auth_token`，启用认证时缺失或错误的 Bearer Token 返回 401。
+
+**ASR 引擎选择**：
+- `services.asr.local_asr = true`（默认）：使用启动时预加载的 sherpa-onnx LocalASREngine
+- `services.asr.local_asr = false` 且 `services.asr.base_url` 已配置：转发到远程 ASR
+- 两者皆不可用时返回 503
 
 ### WebSocket 连接
 
@@ -199,6 +233,15 @@ asyncio.run(main())
 Omni API 兼容 OpenAI Chat Completions 接口格式，TTS API 兼容 OpenAI Speech 接口格式。三种 TTS 后端通过 `services.tts.model` 切换，均支持 HTTP 分句流式和 WebSocket 逐字流式两种模式。
 
 ## 更新记录
+
+### 2026-06-16
+
+- **新增 HTTP ASR 端点**：`POST /v1/audio/transcriptions`，OpenAI Whisper 协议兼容
+  - 支持 WAV/FLAC/OGG/MP3 等 soundfile 可解码格式，或原始 int16 PCM
+  - `local_asr=true` 时复用启动预加载的 LocalASREngine 单例（无重复模型加载）
+  - `local_asr=false` 时转发到 `services.asr.base_url`，可对接 funasr/SenseVoice 等远程服务
+  - 共用 `security.auth_token` Bearer 认证
+- 新增依赖：`soundfile>=0.12.0`、`librosa>=0.10.0`
 
 ### 2026-06-11
 
