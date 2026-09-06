@@ -22,6 +22,7 @@ _DEFAULT_CONFIG = {
         "max_image_b64_bytes": 10485760,
         "max_conversation_items": 200,
         "max_session_audio_seconds": 600,
+        "max_upload_bytes": 52428800,
     },
     "vad": {
         "engine": "silero",
@@ -107,6 +108,12 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+# 无显式路径时，load() 默认读取项目根目录的 config.yaml，
+# 保证绕过 main.py 直接以 uvicorn server.websocket:app 启动时配置仍生效
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.yaml")
+
+
 class ServerConfig:
     """Server configuration singleton."""
 
@@ -122,7 +129,7 @@ class ServerConfig:
     @classmethod
     def load(cls, config_path: str | None = None) -> "ServerConfig":
         if cls._instance is None:
-            cls._instance = cls(config_path)
+            cls._instance = cls(config_path or _DEFAULT_CONFIG_PATH)
         return cls._instance
 
     @classmethod

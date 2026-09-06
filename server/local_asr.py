@@ -329,4 +329,8 @@ class LocalASREngine:
         stream.accept_waveform(_TARGET_SAMPLE_RATE, audio_float)
         self._recognizer.decode_stream(stream)
         result = stream.result
-        return result.text, result.emotion or "", result.event or ""
+        # emotion/event 字段需要较新的 sherpa-onnx；旧版本没有这两个属性时
+        # 降级为空字符串，避免 AttributeError 让整个转写失败
+        emotion = getattr(result, "emotion", "") or ""
+        event = getattr(result, "event", "") or ""
+        return result.text, emotion, event

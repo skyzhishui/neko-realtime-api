@@ -132,8 +132,8 @@ class RealtimeSession:
         # ── Security limits (P0-2) ──────────────────────────────────
         # Override defaults from config.security if present
         _sec = config.get("security", default={})
-        self._max_audio_frame_b64 = _sec.get("max_audio_frame_b64", MAX_AUDIO_FRAME_B64_BYTES) if isinstance(_sec, dict) else MAX_AUDIO_FRAME_B64_BYTES
-        self._max_image_b64 = _sec.get("max_image_b64", MAX_IMAGE_B64_BYTES) if isinstance(_sec, dict) else MAX_IMAGE_B64_BYTES
+        self._max_audio_frame_b64 = _sec.get("max_audio_frame_b64_bytes", MAX_AUDIO_FRAME_B64_BYTES) if isinstance(_sec, dict) else MAX_AUDIO_FRAME_B64_BYTES
+        self._max_image_b64 = _sec.get("max_image_b64_bytes", MAX_IMAGE_B64_BYTES) if isinstance(_sec, dict) else MAX_IMAGE_B64_BYTES
         self._max_conversation_items = _sec.get("max_conversation_items", MAX_CONVERSATION_ITEMS) if isinstance(_sec, dict) else MAX_CONVERSATION_ITEMS
         self._max_session_audio_seconds = _sec.get("max_session_audio_seconds", MAX_SESSION_AUDIO_SECONDS) if isinstance(_sec, dict) else MAX_SESSION_AUDIO_SECONDS
         self._total_input_audio_seconds: float = 0.0
@@ -1454,16 +1454,21 @@ class RealtimeSession:
         if transcript:
             await self.protocol.send_input_transcript(transcript)
         
-        # Append user message to conversation history (for context continuity)
-        if transcript and not self.session_config.tools:
-            self.conversation.append({"role": "user", "content": transcript})
-        
         # Pass clean text to LLM, emotion/event via system prompt
+        # 先基于现有历史构建 messages，再追加本次转录到 conversation：
+        # _build_base_messages 会展开 self.conversation 历史，若先 append
+        # 再构建，同一句转录会在发给 LLM 的 messages 中出现两次。
         messages = self._build_omni_messages(
             transcript, is_audio=False,
             emotion_context=emotion_context,
             captured_images=captured_images,
         )
+        
+        # Append user message to conversation history (for context continuity).
+        # tools 开启时同样要记录，否则 tool loop 只回写 assistant/tool 消息，
+        # 后续轮次的历史里会缺失所有用户发言。
+        if transcript:
+            self.conversation.append({"role": "user", "content": transcript})
         
         resp_id = await self.protocol.send_response_created()
         self._current_resp_id = resp_id

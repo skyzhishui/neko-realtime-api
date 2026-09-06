@@ -219,7 +219,13 @@ class VoxCpm2TtsPipeline:
                 f"{self.base_url}/audio/speech",
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=self.timeout_s),
+                # 流式合成一句长文本可能超过 timeout_s：total 会中途掐断音频，
+                # 只限制连接建立与读空闲
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    connect=min(self.timeout_s, 10.0),
+                    sock_read=self.timeout_s,
+                ),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()

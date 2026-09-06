@@ -4,8 +4,9 @@
 Recursively walks both structures and asserts every key path exists in both
 with matching values. Exits 0 on success, 1 on mismatch.
 """
-import sys
 import os
+import re
+import sys
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +55,45 @@ def _values_match(a, b):
     return a == b
 
 
+def check_consumer_security_keys(root: str) -> list[str]:
+    """扫描代码中消费的 security.* 配置键，确保都在 _DEFAULT_CONFIG 中定义。
+
+    防止键名不一致（如 max_audio_frame_b64 vs max_audio_frame_b64_bytes）
+    导致 yaml 配置静默失效。
+    """
+    defaults_sec = _DEFAULT_CONFIG.get("security", {})
+    patterns = [
+        # config.get("security", "<key>", ...)
+        re.compile(r'\.get\(\s*"security"\s*,\s*"([A-Za-z0-9_]+)"'),
+        # _sec = config.get("security", ...) 后 _sec.get("<key>", ...)
+        re.compile(r'_sec\.get\(\s*"([A-Za-z0-9_]+)"'),
+    ]
+    files = [os.path.join(root, "main.py")]
+    server_dir = os.path.join(root, "server")
+    if os.path.isdir(server_dir):
+        files += sorted(
+            os.path.join(server_dir, f)
+            for f in os.listdir(server_dir)
+            if f.endswith(".py")
+        )
+
+    errors = []
+    for path in files:
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        fname = os.path.relpath(path, root)
+        for pat in patterns:
+            for key in sorted(set(pat.findall(src))):
+                if key not in defaults_sec:
+                    errors.append(
+                        f"CONSUMER KEY security.{key!r} used in {fname} "
+                        f"but missing in _DEFAULT_CONFIG"
+                    )
+    return errors
+
+
 def main():
     # Load config.yaml.example
     example_path = os.path.join(
@@ -85,6 +125,10 @@ def main():
         elif not _values_match(default_flat[path], value):
             # Already reported above
             pass
+
+    errors += check_consumer_security_keys(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
 
     if errors:
         print("PARITY CHECK FAILED:")

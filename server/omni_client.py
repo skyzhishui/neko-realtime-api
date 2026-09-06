@@ -119,7 +119,13 @@ class OmniAudioClient:
                 f"{self.base_url}/chat/completions",
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout_s),
+                # 流式回复可持续远超 timeout_s，total 上限会把长回复中途掐断；
+                # 只限制连接建立与读空闲（两次收到数据之间的最大间隔）
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    connect=min(timeout_s, 10.0),
+                    sock_read=timeout_s,
+                ),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
